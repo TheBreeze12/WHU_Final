@@ -1,6 +1,9 @@
 #include "toyc/ir.h"
+#include "toyc/ir_printer.h"
 
 #include "check.h"
+
+#include <sstream>
 
 using namespace toyc;
 
@@ -119,6 +122,45 @@ void test_function_and_blocks() {
     toyc::test::check_eq_str("%v.0", add_raw->name(), "add result name %v.0");
 }
 
+void test_printer_basic() {
+    Module m;
+    m.create_global("g_count", 0, /*is_const=*/false);
+    Function* f = m.create_function("f", FuncRet::Int, /*params=*/1);
+    BasicBlock* entry = f->create_block();
+    Value* a = f->param(0);
+
+    auto alloca = std::make_unique<AllocaInst>(m.fresh_id());
+    Value* slot = alloca.get();
+    auto store = std::make_unique<StoreInst>(slot, a);
+    auto load = std::make_unique<LoadInst>(slot, m.fresh_id());
+    Value* loaded = load.get();
+    ConstantInt* one = m.get_constant(1);
+    auto add = std::make_unique<BinaryInst>(Opcode::Add, loaded, one, m.fresh_id());
+    Value* addv = add.get();
+    auto ret = std::make_unique<RetInst>(addv);
+    entry->push_back(std::move(alloca));
+    entry->push_back(std::move(store));
+    entry->push_back(std::move(load));
+    entry->push_back(std::move(add));
+    entry->push_back(std::move(ret));
+
+    std::ostringstream out;
+    print_module(m, out);
+
+    std::string expected =
+        "@g_count = global i32 0\n"
+        "\n"
+        "define i32 @f(i32 %arg.0) {\n"
+        "entry:\n"
+        "  %v.0 = alloca i32\n"
+        "  store %v.0, %arg.0\n"
+        "  %v.1 = load %v.0\n"
+        "  %v.2 = add %v.1, 1\n"
+        "  ret %v.2\n"
+        "}\n";
+    toyc::test::check_eq_str(expected, out.str(), "module print");
+}
+
 }  // namespace
 
 int main() {
@@ -126,5 +168,6 @@ int main() {
     test_constant_pool_and_globals();
     test_instruction_construction();
     test_function_and_blocks();
+    test_printer_basic();
     return toyc::test::report();
 }

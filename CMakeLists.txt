@@ -17,6 +17,7 @@ add_executable(toyc-compiler
     src/frontend/ast_visitor.cpp
     src/frontend/ast_access.cpp
     src/ir/ir.cpp
+    src/ir/ir_printer.cpp
 )
 
 target_include_directories(toyc-compiler PRIVATE include)
@@ -39,6 +40,7 @@ add_test(
 add_executable(toyc-ir-tests
     test/ir/ir_tests.cpp
     src/ir/ir.cpp
+    src/ir/ir_printer.cpp
 )
 target_include_directories(toyc-ir-tests PRIVATE include test/ir)
 if(NOT MSVC)
