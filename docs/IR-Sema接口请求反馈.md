@@ -3,7 +3,7 @@
 > 发起方：IR + 优化组（分工第 3 人）
 > 请求方：**语义分析组**（Sema）；抄送前端组
 > 关联：[`docs/superpowers/specs/2026-06-22-toyc-ir-optim-design.md`](./superpowers/specs/2026-06-22-toyc-ir-optim-design.md) §3（IRGen 接口契约）、[`docs/frontend-协作说明.md`](./frontend-协作说明.md)
-> 状态：**等待 Sema 反馈**（Sema 尚未实现，现在定接口成本最低）
+> 状态：**等待 Sema 反馈**（前端组已于 2026-06-22 回复，见 [`IR-Sema接口请求反馈-前端组.md`](./IR-Sema接口请求反馈-前端组.md)）
 
 ---
 
@@ -165,7 +165,7 @@ IRGen 自建全局符号表 + 块作用域栈 + 常量折叠器。
 - **Q2（需求 B 传递方式）**：常量折叠结果以何种形式交付？IRGen 倾向 **方案 2 的 `const_values`**（或方案 1 的 `IdentExpr::const_value`）。是否由 Sema 负责**把对 const 的引用直接标注为字面量**？
 - **Q3（需求 C）**：函数返回类型，确认 **IRGen 自扫顶层 `FuncDef` 签名** 即可（不需 Sema 专门标注）？还是 Sema 顺带在 `CallExpr` 标注？
 - **Q4（`SymbolRef` 定义）**：若选方案 2，`SymbolRef` 由 Sema 定义并暴露给 IRGen。它需要携带哪些信息？IRGen 至少需要区分 `{局部var, 局部const, 形参, 全局var, 全局const}` 五类，并能定位到对应声明节点。
-- **Q5（全局变量初值）**：关联总设计 §15 开放问题 3——全局变量初值是否允许含**运行期表达式**（如函数调用）？若允许，IRGen 需生成运行期 init 代码（影响 IRGen 设计）。IRGen 当前假设"初值 = 常量折叠可求值"。请 Sema 与助教确认后同步。
+- **Q5（全局变量初值）**：~~关联总设计 §15 开放问题 3~~ **已拍板（前端组 2026-06-22）**：全局变量初值 **不允许** 含运行期表达式；必须编译期可求值（规则同 const 折叠：字面量 + const + 算逻运算）。Sema 报错；IRGen 按静态初值写入 `.data`。
 - **Q6（交付时机）**：Sema 预计何时能交付 `SemaResult`（或等价接口）？以便 IRGen 排期。在 Sema 就绪前，IRGen 是否先用方案 3 打通 M1/M2？
 
 ---
@@ -177,3 +177,24 @@ IRGen 自建全局符号表 + 块作用域栈 + 常量折叠器。
 1. IRGen **只读** Sema 的结果（`SemaResult` 或标注字段），不修改。
 2. IRGen 假定 Sema 已通过全部语义检查（未声明使用、重定义、void 误用、路径 return、break/continue 上下文等），IRGen **不做语义检查**，只消费结果。
 3. IRGen 接口收敛在"AST + Sema 结果"，不依赖 Sema 内部符号表实现细节。
+
+---
+
+## 7. 前端组反馈（2026-06-22）
+
+前端组已正式回复，详见 [`IR-Sema接口请求反馈-前端组.md`](./IR-Sema接口请求反馈-前端组.md)。
+
+**摘要：**
+
+| 问题 | 前端立场 |
+|------|----------|
+| Q1 | ✅ 方案 2（side-table），不改 `ast.h` |
+| Q2 | ✅ Sema 经 `SemaResult::const_values` 交付 |
+| Q3 | ✅ IRGen 自扫 `FuncDef`；前端提供 `build_func_signature_map()` |
+| Q4 | ✅ 采用 `SymbolStorageKind`（`ast_contract.h`）+ Sema 定义 `SymbolRef` |
+| Q5 | ✅ **不允许运行期表达式**；初值须编译期可求值（Sema 检查） |
+| Q6 | 非前端排期 |
+
+**前端已交付：** `ast_contract.h`、`ast_access.h`、细粒度 `ASTVisitor`、AST 生命周期约定。
+
+**待 Sema 拍板后更新本文档状态为「接口已冻结」。**

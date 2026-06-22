@@ -15,6 +15,7 @@ add_executable(toyc-compiler
     src/frontend/ast.cpp
     src/frontend/ast_printer.cpp
     src/frontend/ast_visitor.cpp
+    src/frontend/ast_access.cpp
 )
 
 target_include_directories(toyc-compiler PRIVATE include)

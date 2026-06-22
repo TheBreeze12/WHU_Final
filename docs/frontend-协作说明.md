@@ -143,3 +143,43 @@ ctest --test-dir build -C Debug -R parser_regression
 ## 11. 测试 Bug 记录
 
 开发与回归测试期间遇到的问题及补丁说明见 [`frontend-测试Bug记录与补丁.md`](./frontend-测试Bug记录与补丁.md)。
+
+## 12. 与 IR / Sema 的接口（2026-06-22）
+
+IR 组接口请求见 [`IR-Sema接口请求反馈.md`](./IR-Sema接口请求反馈.md)；**前端正式回复**见 [`IR-Sema接口请求反馈-前端组.md`](./IR-Sema接口请求反馈-前端组.md)。
+
+### 12.1 前端承诺
+
+- **AST 保持纯净**：不在 Parser 产物上写语义标注；R1/R2 由 Sema `SemaResult` side-table 交付。
+- **节点地址稳定**：Sema/IRGen 可用 `const IdentExpr*` 等作 map key（见 `ast_contract.h`）。
+- **遍历**：细粒度 `ASTVisitor`（`visit_ident`、`visit_assign_stmt` 等）供 Sema/IRGen 继承。
+- **Q5 已拍板**：全局变量初值 **不允许** 运行期表达式；须编译期可求值。Parser 不限制，**Sema 报错**。
+
+### 12.2 下游可用头文件
+
+| 头文件 | 内容 |
+|--------|------|
+| `toyc/ast.h` | AST 节点 |
+| `toyc/ast_visitor.h` | 遍历 |
+| `toyc/ast_access.h` | `as_ident`、`build_func_signature_map` 等 |
+| `toyc/ast_contract.h` | `SymbolStorageKind`、`ValueKind`、生命周期约定 |
+| `toyc/diagnostics.h` | 统一诊断（Sema 用 `DiagnosticStage::Sema`） |
+
+### 12.3 Sema 接入示例
+
+```cpp
+#include "toyc/ast_access.h"
+#include "toyc/ast_contract.h"
+#include "toyc/ast_visitor.h"
+
+class SemaChecker : public toyc::ASTVisitor {
+public:
+    void visit_ident(const toyc::IdentExpr& node) override {
+        // 查符号表，写入 SemaResult.idents[&node] = SymbolRef{...}
+    }
+    void visit_assign_stmt(const toyc::AssignStmt& node) override {
+        // 写入 SemaResult.assigns[&node]
+        toyc::ASTVisitor::visit_assign_stmt(node);
+    }
+};
+```

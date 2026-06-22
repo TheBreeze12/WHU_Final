@@ -1,0 +1,2 @@
+error [lex] 5:1: unterminated block comment
+error [parse] 5:1: expected '}'
