@@ -69,4 +69,36 @@ void Value::replace_all_uses_with(Value* other) {
     uses_.clear();
 }
 
+ConstantInt* Module::get_constant(int value) {
+    auto it = constants_.find(value);
+    if (it != constants_.end()) {
+        return it->second.get();
+    }
+    auto owned = std::make_unique<ConstantInt>(value);
+    ConstantInt* raw = owned.get();
+    constants_.emplace(value, std::move(owned));
+    return raw;
+}
+
+GlobalVar* Module::create_global(const std::string& name, int init_value, bool is_const) {
+    auto addr = std::make_unique<GlobalAddr>(name);
+    GlobalAddr* addr_raw = addr.get();
+    global_addrs_.push_back(std::move(addr));
+
+    auto gv = std::make_unique<GlobalVar>();
+    gv->addr = addr_raw;
+    gv->init = get_constant(init_value);
+    gv->is_const = is_const;
+    GlobalVar* gv_raw = gv.get();
+    globals_.push_back(std::move(gv));
+    return gv_raw;
+}
+
+Value* Module::create_register(Type type) {
+    auto owned = std::make_unique<Value>(type, ValueKind::Register, fresh_id());
+    Value* raw = owned.get();
+    registers_.push_back(std::move(owned));
+    return raw;
+}
+
 }  // namespace toyc
