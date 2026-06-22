@@ -59,10 +59,43 @@ void test_constant_pool_and_globals() {
     toyc::test::check(r->type() == Type::I32, "register type i32");
 }
 
+void test_instruction_construction() {
+    Module m;
+    Value* a = m.create_register(Type::I32);
+    Value* b = m.create_register(Type::I32);
+
+    auto add = std::make_unique<BinaryInst>(Opcode::Add, a, b, m.fresh_id());
+    toyc::test::check(add->opcode() == Opcode::Add, "add opcode");
+    toyc::test::check(add->type() == Type::I32, "add result i32");
+    toyc::test::check(add->has_result(), "add has result");
+    toyc::test::check(add->operand(0) == a && add->operand(1) == b, "add operands");
+    toyc::test::check(add->num_operands() == 2, "add 2 operands");
+    toyc::test::check(!add->is_terminator(), "add not terminator");
+    toyc::test::check(a->uses().size() == 1, "a used by add");
+
+    auto slt = std::make_unique<ICmpInst>(Opcode::ICmpSlt, a, b, m.fresh_id());
+    toyc::test::check(slt->opcode() == Opcode::ICmpSlt && slt->type() == Type::I32, "icmp i32 result");
+
+    ConstantInt* one = m.get_constant(1);
+    auto ret = std::make_unique<RetInst>(one);
+    toyc::test::check(ret->is_terminator(), "ret terminator");
+    toyc::test::check(!ret->has_result(), "ret has no result");
+    toyc::test::check(ret->operand(0) == one, "ret operand");
+
+    auto ret_void = std::make_unique<RetInst>(/*value=*/nullptr);
+    toyc::test::check(ret_void->num_operands() == 0, "void ret 0 operands");
+
+    auto store = std::make_unique<StoreInst>(a, b);
+    toyc::test::check(store->opcode() == Opcode::Store, "store opcode");
+    toyc::test::check(!store->has_result(), "store has no result");
+    toyc::test::check(store->operand(0) == a && store->operand(1) == b, "store operands ptr,val");
+}
+
 }  // namespace
 
 int main() {
     test_use_list_wiring();
     test_constant_pool_and_globals();
+    test_instruction_construction();
     return toyc::test::report();
 }

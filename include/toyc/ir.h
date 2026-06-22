@@ -87,6 +87,153 @@ struct GlobalVar {
 
 class Function;  // forward
 class Module;
+class BasicBlock;  // forward
+
+enum class Opcode {
+    Add, Sub, Mul, Sdiv, Srem, Neg,
+    ICmpEq, ICmpNe, ICmpSlt, ICmpSgt, ICmpSle, ICmpSge,
+    Alloca, Load, Store,
+    Br, CondBr, Ret, Call,
+    Phi,
+    Shl, Shr,  // introduced only by optimization (design §7/§8.6)
+};
+const char* opcode_name(Opcode opcode);
+
+class Instruction : public User {
+public:
+    Instruction(Opcode opcode, Type type, unsigned id)
+        : User(type, ValueKind::Register, id), opcode_(opcode) {}
+
+    Opcode opcode() const { return opcode_; }
+    BasicBlock* parent() const { return parent_; }
+    void set_parent(BasicBlock* bb) { parent_ = bb; }
+
+    bool is_terminator() const {
+        return opcode_ == Opcode::Br || opcode_ == Opcode::CondBr || opcode_ == Opcode::Ret;
+    }
+    virtual bool has_result() const {
+        return !(opcode_ == Opcode::Store || opcode_ == Opcode::Br ||
+                 opcode_ == Opcode::CondBr || opcode_ == Opcode::Ret);
+    }
+
+private:
+    Opcode opcode_;
+    BasicBlock* parent_ = nullptr;
+};
+
+class BinaryInst : public Instruction {
+public:
+    BinaryInst(Opcode opcode, Value* lhs, Value* rhs, unsigned id)
+        : Instruction(opcode, Type::I32, id) {
+        add_operand(lhs);
+        add_operand(rhs);
+    }
+};
+
+class ICmpInst : public Instruction {
+public:
+    ICmpInst(Opcode opcode, Value* lhs, Value* rhs, unsigned id)
+        : Instruction(opcode, Type::I32, id) {
+        add_operand(lhs);
+        add_operand(rhs);
+    }
+};
+
+class NegInst : public Instruction {
+public:
+    NegInst(Value* operand, unsigned id) : Instruction(Opcode::Neg, Type::I32, id) {
+        add_operand(operand);
+    }
+};
+
+class AllocaInst : public Instruction {
+public:
+    explicit AllocaInst(unsigned id) : Instruction(Opcode::Alloca, Type::Ptr, id) {}
+};
+
+class LoadInst : public Instruction {
+public:
+    LoadInst(Value* ptr, unsigned id) : Instruction(Opcode::Load, Type::I32, id) {
+        add_operand(ptr);
+    }
+};
+
+class StoreInst : public Instruction {
+public:
+    // store <ptr>, <val>  (pointer first — design §4.5 decision)
+    StoreInst(Value* ptr, Value* val) : Instruction(Opcode::Store, Type::Void, 0) {
+        add_operand(ptr);
+        add_operand(val);
+    }
+};
+
+class BrInst : public Instruction {
+public:
+    explicit BrInst(BasicBlock* target);
+};
+
+class CondBrInst : public Instruction {
+public:
+    CondBrInst(Value* cond, BasicBlock* t, BasicBlock* f);
+};
+
+class RetInst : public Instruction {
+public:
+    explicit RetInst(Value* value = nullptr) : Instruction(Opcode::Ret, Type::Void, 0) {
+        if (value) {
+            add_operand(value);
+        }
+    }
+};
+
+class CallInst : public Instruction {
+public:
+    CallInst(std::string callee_name, std::vector<Value*> args, bool returns_void, unsigned id)
+        : Instruction(Opcode::Call, returns_void ? Type::Void : Type::I32, id),
+          callee_name_(std::move(callee_name)), returns_void_(returns_void) {
+        for (Value* a : args) {
+            add_operand(a);
+        }
+    }
+    bool has_result() const override { return !returns_void_; }
+    const std::string& callee_name() const { return callee_name_; }
+
+private:
+    std::string callee_name_;
+    bool returns_void_;
+};
+
+class PhiInst : public Instruction {
+public:
+    explicit PhiInst(unsigned id) : Instruction(Opcode::Phi, Type::I32, id) {}
+    void add_incoming(Value* value, BasicBlock* block);
+    const std::vector<BasicBlock*>& incoming_blocks() const { return incoming_blocks_; }
+
+private:
+    std::vector<BasicBlock*> incoming_blocks_;
+};
+
+class ShlInst : public Instruction {
+public:
+    ShlInst(Value* value, unsigned amount, unsigned id)
+        : Instruction(Opcode::Shl, Type::I32, id), amount_(amount) {
+        add_operand(value);
+    }
+    unsigned amount() const { return amount_; }
+private:
+    unsigned amount_;
+};
+
+class ShrInst : public Instruction {
+public:
+    ShrInst(Value* value, unsigned amount, unsigned id)
+        : Instruction(Opcode::Shr, Type::I32, id), amount_(amount) {
+        add_operand(value);
+    }
+    unsigned amount() const { return amount_; }
+private:
+    unsigned amount_;
+};
 
 class Module {
 public:

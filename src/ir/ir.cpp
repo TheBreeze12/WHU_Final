@@ -69,6 +69,39 @@ void Value::replace_all_uses_with(Value* other) {
     uses_.clear();
 }
 
+const char* opcode_name(Opcode opcode) {
+    switch (opcode) {
+        case Opcode::Add: return "add";
+        case Opcode::Sub: return "sub";
+        case Opcode::Mul: return "mul";
+        case Opcode::Sdiv: return "sdiv";
+        case Opcode::Srem: return "srem";
+        case Opcode::Neg: return "neg";
+        case Opcode::ICmpEq: return "icmp eq";
+        case Opcode::ICmpNe: return "icmp ne";
+        case Opcode::ICmpSlt: return "icmp slt";
+        case Opcode::ICmpSgt: return "icmp sgt";
+        case Opcode::ICmpSle: return "icmp sle";
+        case Opcode::ICmpSge: return "icmp sge";
+        case Opcode::Alloca: return "alloca";
+        case Opcode::Load: return "load";
+        case Opcode::Store: return "store";
+        case Opcode::Br: return "br";
+        case Opcode::CondBr: return "cond_br";
+        case Opcode::Ret: return "ret";
+        case Opcode::Call: return "call";
+        case Opcode::Phi: return "phi";
+        case Opcode::Shl: return "shl";
+        case Opcode::Shr: return "shr";
+    }
+    return "?";
+}
+
+void PhiInst::add_incoming(Value* value, BasicBlock* block) {
+    add_operand(value);
+    incoming_blocks_.push_back(block);
+}
+
 ConstantInt* Module::get_constant(int value) {
     auto it = constants_.find(value);
     if (it != constants_.end()) {
