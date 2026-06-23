@@ -16,6 +16,9 @@ add_executable(toyc-compiler
     src/frontend/ast_printer.cpp
     src/frontend/ast_visitor.cpp
     src/frontend/ast_access.cpp
+    src/ir/ir.cpp
+    src/ir/ir_printer.cpp
+    src/ir/ir_builder.cpp
 )
 
 target_include_directories(toyc-compiler PRIVATE include)
@@ -33,4 +36,20 @@ add_test(
     COMMAND ${CMAKE_COMMAND}
         -DCOMPILER=$<TARGET_FILE:toyc-compiler>
         -P ${CMAKE_SOURCE_DIR}/test/regression/parser/run_tests.cmake
+)
+
+add_executable(toyc-ir-tests
+    test/ir/ir_tests.cpp
+    src/ir/ir.cpp
+    src/ir/ir_printer.cpp
+    src/ir/ir_builder.cpp
+)
+target_include_directories(toyc-ir-tests PRIVATE include test/ir)
+if(NOT MSVC)
+    target_compile_options(toyc-ir-tests PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_test(
+    NAME ir_tests
+    COMMAND toyc-ir-tests
 )
