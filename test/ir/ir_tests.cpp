@@ -484,6 +484,80 @@ void test_dce_keeps_live_chain() {
     toyc::test::check(entry->insts().size() == 2, "dce: add+ret kept, mul gone");
 }
 
+void test_gvn_cse_identical() {
+    Module m;
+    Function* f = m.create_function("f", FuncRet::Int, 2);
+    BasicBlock* entry = f->create_block();
+    Value* a = f->param(0);
+    Value* b = f->param(1);
+    auto add1 = std::make_unique<BinaryInst>(Opcode::Add, a, b, m.fresh_id());
+    Instruction* a1 = add1.get();
+    auto add2 = std::make_unique<BinaryInst>(Opcode::Add, a, b, m.fresh_id());  // dup
+    Instruction* a2 = add2.get();
+    auto sum = std::make_unique<BinaryInst>(Opcode::Add, a1, a2, m.fresh_id());
+    Instruction* sum_raw = sum.get();
+    entry->push_back(std::move(add1));
+    entry->push_back(std::move(add2));
+    entry->push_back(std::move(sum));
+    entry->push_back(std::make_unique<RetInst>(sum_raw));
+
+    bool changed = gvn(*f);
+    toyc::test::check(changed, "gvn: changed");
+    bool a2_present = false;
+    for (const std::unique_ptr<Instruction>& inst : entry->insts()) if (inst.get() == a2) a2_present = true;
+    toyc::test::check(!a2_present, "gvn: duplicate add removed");
+    toyc::test::check(sum_raw->operand(0) == a1 && sum_raw->operand(1) == a1, "gvn: sum uses first add twice");
+}
+
+void test_gvn_commutative() {
+    // add(a,b) and add(b,a) must CSE together via operand normalization.
+    Module m;
+    Function* f = m.create_function("f", FuncRet::Int, 2);
+    BasicBlock* entry = f->create_block();
+    Value* a = f->param(0);
+    Value* b = f->param(1);
+    auto add1 = std::make_unique<BinaryInst>(Opcode::Add, a, b, m.fresh_id());
+    Instruction* a1 = add1.get();
+    auto add2 = std::make_unique<BinaryInst>(Opcode::Add, b, a, m.fresh_id());  // commutative dup
+    Instruction* a2 = add2.get();
+    auto sum = std::make_unique<BinaryInst>(Opcode::Add, a1, a2, m.fresh_id());
+    entry->push_back(std::move(add1));
+    entry->push_back(std::move(add2));
+    entry->push_back(std::move(sum));
+    entry->push_back(std::make_unique<RetInst>(sum.get()));
+
+    gvn(*f);
+    bool a2_present = false;
+    for (const std::unique_ptr<Instruction>& inst : entry->insts()) if (inst.get() == a2) a2_present = true;
+    toyc::test::check(!a2_present, "gvn: commutative duplicate removed");
+}
+
+void test_gvn_dominance_scoped() {
+    // add(a,b) in a non-dominating sibling block must NOT be reused.
+    //   entry -> left, right ; left: add a,b; ret ; right: add a,b; ret
+    Module m;
+    Function* f = m.create_function("f", FuncRet::Int, 2);
+    BasicBlock* entry = f->create_block();
+    BasicBlock* left = f->create_block();
+    BasicBlock* right = f->create_block();
+    Value* a = f->param(0);
+    Value* b = f->param(1);
+    entry->push_back(std::make_unique<CondBrInst>(a, left, right));
+    auto l_add = std::make_unique<BinaryInst>(Opcode::Add, a, b, m.fresh_id());
+    left->push_back(std::move(l_add));
+    left->push_back(std::make_unique<RetInst>(a));
+    auto r_add = std::make_unique<BinaryInst>(Opcode::Add, a, b, m.fresh_id());
+    Instruction* r_add_raw = r_add.get();
+    right->push_back(std::move(r_add));
+    right->push_back(std::make_unique<RetInst>(r_add_raw));
+
+    gvn(*f);
+    // right's add survives: left does not dominate right.
+    bool right_add_present = false;
+    for (const std::unique_ptr<Instruction>& inst : right->insts()) if (inst.get() == r_add_raw) right_add_present = true;
+    toyc::test::check(right_add_present, "gvn: non-dominating add kept");
+}
+
 }  // namespace
 
 int main() {
@@ -505,5 +579,8 @@ int main() {
     test_constprop_skips_div_zero();
     test_dce_removes_dead_compute();
     test_dce_keeps_live_chain();
+    test_gvn_cse_identical();
+    test_gvn_commutative();
+    test_gvn_dominance_scoped();
     return toyc::test::report();
 }
