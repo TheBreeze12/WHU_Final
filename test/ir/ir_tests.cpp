@@ -489,6 +489,25 @@ void test_constprop_skips_div_zero() {
     toyc::test::check(entry->insts().size() == 2, "cp: div preserved");
 }
 
+void test_constprop_keeps_call() {
+    // An int-returning call with two constant operands must NOT be folded: it
+    // reaches the binary-fold branch by operand count, but Call is not a binary
+    // arithmetic/compare op. Guards the explicit Call exclusion in constprop.
+    Module m;
+    Function* f = m.create_function("f", FuncRet::Int, 0);
+    BasicBlock* entry = f->create_block();
+    auto call = std::make_unique<CallInst>(
+        "g", std::vector<Value*>{m.get_constant(2), m.get_constant(3)}, false, m.fresh_id());
+    Instruction* call_raw = call.get();
+    entry->push_back(std::move(call));
+    entry->push_back(std::make_unique<RetInst>(call_raw));
+
+    bool changed = constprop(*f);
+    toyc::test::check(!changed, "cp-call: call not folded");
+    toyc::test::check(entry->insts().size() == 2, "cp-call: call + ret preserved");
+    toyc::test::check(entry->insts().front()->opcode() == Opcode::Call, "cp-call: call remains");
+}
+
 void test_dce_removes_dead_compute() {
     Module m;
     Function* f = m.create_function("f", FuncRet::Int, 0);
@@ -685,6 +704,7 @@ int main() {
     test_constprop_folds_binary();
     test_constprop_propagates_chain();
     test_constprop_skips_div_zero();
+    test_constprop_keeps_call();
     test_dce_removes_dead_compute();
     test_dce_keeps_live_chain();
     test_gvn_cse_identical();

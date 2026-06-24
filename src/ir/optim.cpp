@@ -289,7 +289,7 @@ bool constprop(Function& fn) {
                     if (o->value_kind() == ValueKind::Constant) {
                         folded = fn.module()->get_constant(-static_cast<ConstantInt*>(o)->value());
                     }
-                } else if (inst->num_operands() == 2) {
+                } else if (op != Opcode::Call && inst->num_operands() == 2) {
                     Value* a = inst->operand(0);
                     Value* b = inst->operand(1);
                     if (a->value_kind() == ValueKind::Constant &&
