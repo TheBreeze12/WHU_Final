@@ -53,12 +53,7 @@ public:
 private:
     Value* eval_expr(const Expr& expr);
     Value* short_circuit(bool is_and, const Expr& lhs, const Expr& rhs);
-    std::optional<int> try_fold(const Expr& expr) const;
 
-    void push_scope();
-    void pop_scope();
-    void declare(const std::string& name, Symbol sym);
-    Symbol* resolve(const std::string& name);
     Symbol* resolve_ref(const SymbolRef& ref);
 
     Value* alloca_in_entry();
@@ -75,7 +70,6 @@ private:
     struct LoopFrame { BasicBlock* cond; BasicBlock* exit; };
     std::vector<LoopFrame> loops_;
 
-    std::vector<std::unordered_map<std::string, Symbol>> scopes_;
     std::unordered_map<const void*, Symbol> symbols_;
     Value* last_value_ = nullptr;
     bool had_error_ = false;

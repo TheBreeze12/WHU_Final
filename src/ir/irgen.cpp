@@ -24,23 +24,6 @@ Value* IRGenerator::alloca_in_entry() {
     return raw;
 }
 
-void IRGenerator::push_scope() { scopes_.emplace_back(); }
-void IRGenerator::pop_scope() { scopes_.pop_back(); }
-
-void IRGenerator::declare(const std::string& name, Symbol sym) {
-    scopes_.back().emplace(name, std::move(sym));
-}
-
-Symbol* IRGenerator::resolve(const std::string& name) {
-    for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
-        auto found = it->find(name);
-        if (found != it->end()) {
-            return &found->second;
-        }
-    }
-    return nullptr;
-}
-
 Symbol* IRGenerator::resolve_ref(const SymbolRef& ref) {
     auto found = symbols_.find(ref.decl);
     if (found == symbols_.end()) {
@@ -48,52 +31,6 @@ Symbol* IRGenerator::resolve_ref(const SymbolRef& ref) {
         return nullptr;
     }
     return &found->second;
-}
-
-std::optional<int> IRGenerator::try_fold(const Expr& expr) const {
-    if (const IntLiteralExpr* lit = as_int_literal(expr)) {
-        return lit->value;
-    }
-    if (const IdentExpr* id = as_ident(expr)) {
-        for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
-            auto found = it->find(id->name);
-            if (found != it->end() && found->second.const_value) {
-                return found->second.const_value;
-            }
-        }
-        return std::nullopt;
-    }
-    if (const BinaryExpr* b = as_binary(expr)) {
-        auto l = try_fold(*b->lhs);
-        auto r = try_fold(*b->rhs);
-        if (!l || !r) return std::nullopt;
-        switch (b->op) {
-            case BinaryOp::Add: return *l + *r;
-            case BinaryOp::Sub: return *l - *r;
-            case BinaryOp::Mul: return *l * *r;
-            case BinaryOp::Div: return *r == 0 ? std::optional<int>{} : *l / *r;
-            case BinaryOp::Mod: return *r == 0 ? std::optional<int>{} : *l % *r;
-            case BinaryOp::Lt: return *l < *r;
-            case BinaryOp::Le: return *l <= *r;
-            case BinaryOp::Gt: return *l > *r;
-            case BinaryOp::Ge: return *l >= *r;
-            case BinaryOp::Eq: return *l == *r;
-            case BinaryOp::Ne: return *l != *r;
-            case BinaryOp::And: return *l && *r;
-            case BinaryOp::Or: return *l || *r;
-        }
-        return std::nullopt;
-    }
-    if (const UnaryExpr* u = as_unary(expr)) {
-        auto v = try_fold(*u->operand);
-        if (!v) return std::nullopt;
-        switch (u->op) {
-            case UnaryOp::Plus: return *v;
-            case UnaryOp::Minus: return -*v;
-            case UnaryOp::Not: return !*v;
-        }
-    }
-    return std::nullopt;
 }
 
 Value* IRGenerator::eval_expr(const Expr& expr) {
@@ -348,7 +285,6 @@ std::unique_ptr<Module> IRGenerator::generate(const CompUnit& unit, const SemaRe
     sema_ = &sema;
     module_ = std::make_unique<Module>();
     symbols_.clear();
-    scopes_.clear();
     had_error_ = false;
     visit_comp_unit(unit);
     if (had_error_) {
