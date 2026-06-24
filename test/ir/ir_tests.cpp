@@ -558,6 +558,55 @@ void test_gvn_dominance_scoped() {
     toyc::test::check(right_add_present, "gvn: non-dominating add kept");
 }
 
+void test_cfs_folds_const_branch() {
+    // cond_br 1 -> br then; else unreachable -> removed; then merged into entry.
+    Module m;
+    Function* f = m.create_function("f", FuncRet::Int, 0);
+    BasicBlock* entry = f->create_block();
+    BasicBlock* thenB = f->create_block();
+    BasicBlock* elseB = f->create_block();
+    entry->push_back(std::make_unique<CondBrInst>(m.get_constant(1), thenB, elseB));
+    thenB->push_back(std::make_unique<RetInst>(m.get_constant(7)));
+    elseB->push_back(std::make_unique<RetInst>(m.get_constant(8)));
+
+    bool changed = cfs(*f);
+    toyc::test::check(changed, "cfs: changed");
+    bool else_present = false;
+    for (const std::unique_ptr<BasicBlock>& b : f->blocks()) if (b.get() == elseB) else_present = true;
+    toyc::test::check(!else_present, "cfs: unreachable else removed");
+    Instruction* term = f->entry()->terminator();
+    toyc::test::check(term->opcode() == Opcode::Ret, "cfs: entry ends in ret");
+    toyc::test::check(static_cast<ConstantInt*>(term->operand(0))->value() == 7, "cfs: ret 7");
+}
+
+void test_cfs_trivial_phi() {
+    // Two preds, phi with identical incomings -> replaced by that value.
+    Module m;
+    Function* f = m.create_function("f", FuncRet::Int, 1);
+    BasicBlock* entry = f->create_block();
+    BasicBlock* left = f->create_block();
+    BasicBlock* right = f->create_block();
+    BasicBlock* merge = f->create_block();
+    Value* c = f->param(0);
+    entry->push_back(std::make_unique<CondBrInst>(c, left, right));
+    left->push_back(std::make_unique<BrInst>(merge));
+    right->push_back(std::make_unique<BrInst>(merge));
+    auto phi = std::make_unique<PhiInst>(m.fresh_id());
+    PhiInst* phi_raw = phi.get();
+    phi->add_incoming(m.get_constant(5), left);
+    phi->add_incoming(m.get_constant(5), right);
+    merge->push_back(std::move(phi));
+    merge->push_back(std::make_unique<RetInst>(phi_raw));
+
+    cfs(*f);
+    Instruction* term = merge->terminator();
+    toyc::test::check(term->opcode() == Opcode::Ret, "cfs-phi: ret");
+    toyc::test::check(static_cast<ConstantInt*>(term->operand(0))->value() == 5, "cfs-phi: ret 5");
+    bool phi_present = false;
+    for (const std::unique_ptr<Instruction>& inst : merge->insts()) if (inst.get() == phi_raw) phi_present = true;
+    toyc::test::check(!phi_present, "cfs-phi: trivial phi removed");
+}
+
 }  // namespace
 
 int main() {
@@ -582,5 +631,7 @@ int main() {
     test_gvn_cse_identical();
     test_gvn_commutative();
     test_gvn_dominance_scoped();
+    test_cfs_folds_const_branch();
+    test_cfs_trivial_phi();
     return toyc::test::report();
 }

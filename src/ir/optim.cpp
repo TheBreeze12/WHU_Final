@@ -117,6 +117,145 @@ void gvn_walk(BasicBlock* bb, DominatorTree& dt,
     for (const GvnKey& k : inserted) avail.erase(k);
 }
 
+bool cfs_fold_branches(Function& fn) {
+    bool changed = false;
+    for (const std::unique_ptr<BasicBlock>& owner : fn.blocks()) {
+        BasicBlock* bb = owner.get();
+        Instruction* term = bb->terminator();
+        if (!term || term->opcode() != Opcode::CondBr) continue;
+        Value* cond = term->operand(0);
+        if (cond->value_kind() != ValueKind::Constant) continue;
+        int cv = static_cast<ConstantInt*>(cond)->value();
+        BasicBlock* taken = static_cast<BasicBlock*>(cv != 0 ? term->operand(1) : term->operand(2));
+        std::list<std::unique_ptr<Instruction>>& insts = bb->insts();
+        for (unsigned k = 0; k < term->num_operands(); ++k) term->operand(k)->remove_use(term);
+        insts.pop_back();  // destroy the old CondBr
+        insts.push_back(std::make_unique<BrInst>(taken));
+        changed = true;
+    }
+    return changed;
+}
+
+bool cfs_remove_unreachable(Function& fn) {
+    BasicBlock* entry = fn.entry();
+    if (!entry) return false;
+    std::unordered_set<BasicBlock*> reach;
+    std::vector<BasicBlock*> stk = {entry};
+    while (!stk.empty()) {
+        BasicBlock* bb = stk.back();
+        stk.pop_back();
+        if (!reach.insert(bb).second) continue;
+        Instruction* term = bb->terminator();
+        if (!term) continue;
+        if (term->opcode() == Opcode::Br) {
+            stk.push_back(static_cast<BasicBlock*>(term->operand(0)));
+        } else if (term->opcode() == Opcode::CondBr) {
+            stk.push_back(static_cast<BasicBlock*>(term->operand(1)));
+            stk.push_back(static_cast<BasicBlock*>(term->operand(2)));
+        }
+    }
+    // Drop phi incomings that come from now-unreachable preds.
+    for (const std::unique_ptr<BasicBlock>& owner : fn.blocks()) {
+        BasicBlock* bb = owner.get();
+        if (!reach.count(bb)) continue;
+        for (const std::unique_ptr<Instruction>& inst : bb->insts()) {
+            if (inst->opcode() != Opcode::Phi) break;  // phis live only at block front
+            std::vector<BasicBlock*> keep;
+            for (BasicBlock* p : static_cast<PhiInst*>(inst.get())->incoming_blocks()) {
+                if (reach.count(p)) keep.push_back(p);
+            }
+            if (keep.size() != inst->num_operands()) {
+                static_cast<PhiInst*>(inst.get())->reorder_incoming(keep);
+            }
+        }
+    }
+    bool changed = false;
+    std::list<std::unique_ptr<BasicBlock>>& blocks = fn.blocks();
+    for (auto it = blocks.begin(); it != blocks.end();) {
+        if (!reach.count(it->get())) { it = blocks.erase(it); changed = true; }
+        else ++it;
+    }
+    return changed;
+}
+
+bool cfs_simplify_phi(Function& fn) {
+    std::unordered_set<Instruction*> dead;
+    bool changed = false;
+    bool loop = true;
+    while (loop) {
+        loop = false;
+        for (const std::unique_ptr<BasicBlock>& owner : fn.blocks()) {
+            for (const std::unique_ptr<Instruction>& inst_owner : owner->insts()) {
+                Instruction* inst = inst_owner.get();
+                if (inst->opcode() != Opcode::Phi || dead.count(inst)) continue;
+                Value* rep = nullptr;
+                if (inst->num_operands() == 1) {
+                    rep = inst->operand(0);
+                } else if (inst->num_operands() > 1) {
+                    Value* first = inst->operand(0);
+                    bool same = true;
+                    for (unsigned k = 1; k < inst->num_operands(); ++k) {
+                        if (inst->operand(k) != first) { same = false; break; }
+                    }
+                    if (same) rep = first;
+                }
+                if (rep && rep != inst) {
+                    inst->replace_all_uses_with(rep);
+                    dead.insert(inst);
+                    changed = loop = true;
+                }
+            }
+        }
+    }
+    if (!dead.empty()) erase_dead(fn, dead);
+    return changed;
+}
+
+bool cfs_merge_blocks(Function& fn) {
+    bool changed = false;
+    bool loop = true;
+    while (loop) {
+        loop = false;
+        DominatorTree dt;
+        dt.analyze(fn);
+        BasicBlock* a = nullptr;
+        BasicBlock* b = nullptr;
+        for (const std::unique_ptr<BasicBlock>& owner : fn.blocks()) {
+            BasicBlock* bb = owner.get();
+            Instruction* term = bb->terminator();
+            if (!term || term->opcode() != Opcode::Br) continue;
+            BasicBlock* succ = static_cast<BasicBlock*>(term->operand(0));
+            if (dt.preds(succ).size() != 1) continue;  // succ must have only this predecessor
+            a = bb;
+            b = succ;
+            break;
+        }
+        if (!a) break;
+        // b must not start with a phi (single-pred blocks have none after simplify_phi).
+        bool b_has_phi = false;
+        for (const std::unique_ptr<Instruction>& inst : b->insts()) {
+            if (inst->opcode() == Opcode::Phi) { b_has_phi = true; break; }
+        }
+        if (b_has_phi) break;
+        Instruction* br = a->terminator();
+        for (unsigned k = 0; k < br->num_operands(); ++k) br->operand(k)->remove_use(br);
+        a->insts().pop_back();  // drop a's br
+        std::list<std::unique_ptr<Instruction>>& b_insts = b->insts();
+        while (!b_insts.empty()) {
+            auto it = b_insts.begin();
+            (*it)->set_parent(a);
+            a->insts().push_back(std::move(*it));
+            b_insts.erase(it);
+        }
+        std::list<std::unique_ptr<BasicBlock>>& blocks = fn.blocks();
+        for (auto it = blocks.begin(); it != blocks.end(); ++it) {
+            if (it->get() == b) { blocks.erase(it); break; }
+        }
+        changed = loop = true;
+    }
+    return changed;
+}
+
 }  // namespace
 
 // Filled in by Tasks 2-5; wired by Task 6.
@@ -226,7 +365,14 @@ bool gvn(Function& fn) {
     if (!dead.empty()) erase_dead(fn, dead);
     return changed;
 }
-bool cfs(Function& /*fn*/) { return false; }
+bool cfs(Function& fn) {
+    bool changed = false;
+    changed |= cfs_fold_branches(fn);
+    changed |= cfs_remove_unreachable(fn);
+    changed |= cfs_simplify_phi(fn);
+    changed |= cfs_merge_blocks(fn);
+    return changed;
+}
 
 bool run_optim(Module& /*module*/) { return false; }
 
