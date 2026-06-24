@@ -18,7 +18,8 @@ FuncRet to_func_ret(FuncReturnType t) {
 Value* IRGenerator::alloca_in_entry() {
     auto inst = std::make_unique<AllocaInst>(module_->fresh_id());
     Value* raw = inst.get();
-    entry_->push_front(std::move(inst));
+    alloca_pt_ = entry_->insts().insert(alloca_pt_, std::move(inst));
+    ++alloca_pt_;
     return raw;
 }
 
@@ -124,6 +125,7 @@ void IRGenerator::visit_func_def(const FuncDef& func) {
     Function* fn = module_->create_function(func.name, to_func_ret(func.return_type),
                                             static_cast<unsigned>(func.params.size()));
     entry_ = fn->create_block();
+    alloca_pt_ = entry_->insts().begin();
     builder_ = std::make_unique<IRBuilder>(*module_, entry_);
     current_ret_ = func.return_type;
     push_scope();  // function scope (params + top-level locals), sits on the global scope
@@ -182,14 +184,14 @@ void IRGenerator::visit_if_stmt(const IfStmt& node) {
 
     builder_->set_insert_point(then_bb);
     walk_stmt(*node.then_branch, *this);
-    if (!then_bb->terminator()) {
+    if (!then_bb->is_terminated()) {
         builder_->create_br(merge_bb);
     }
 
     if (else_bb) {
         builder_->set_insert_point(else_bb);
         walk_stmt(*node.else_branch, *this);
-        if (!else_bb->terminator()) {
+        if (!else_bb->is_terminated()) {
             builder_->create_br(merge_bb);
         }
     }
@@ -210,7 +212,7 @@ void IRGenerator::visit_while_stmt(const WhileStmt& node) {
     loops_.push_back({cond_bb, exit_bb});
     builder_->set_insert_point(body_bb);
     walk_stmt(*node.body, *this);
-    if (!body_bb->terminator()) {
+    if (!body_bb->is_terminated()) {
         builder_->create_br(cond_bb);
     }
     loops_.pop_back();
