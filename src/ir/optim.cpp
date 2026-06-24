@@ -374,6 +374,20 @@ bool cfs(Function& fn) {
     return changed;
 }
 
-bool run_optim(Module& /*module*/) { return false; }
+bool run_optim(Module& module) {
+    bool any = false;
+    for (int iter = 0; iter < 10; ++iter) {
+        bool changed = false;
+        for (const std::unique_ptr<Function>& fn : module.functions()) {
+            changed |= constprop(*fn);
+            changed |= dce(*fn);
+            changed |= gvn(*fn);
+            changed |= cfs(*fn);
+        }
+        if (!changed) break;
+        any = true;
+    }
+    return any;
+}
 
 }  // namespace toyc

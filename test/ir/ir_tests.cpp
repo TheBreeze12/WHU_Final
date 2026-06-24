@@ -607,6 +607,27 @@ void test_cfs_trivial_phi() {
     toyc::test::check(!phi_present, "cfs-phi: trivial phi removed");
 }
 
+void test_run_optim_fixpoint() {
+    // mul 3,4 -> 12 (ConstProp) exposes add 2,12 -> 14 (ConstProp next round).
+    Module m;
+    Function* f = m.create_function("main", FuncRet::Int, 0);
+    BasicBlock* entry = f->create_block();
+    auto mul = std::make_unique<BinaryInst>(Opcode::Mul, m.get_constant(3), m.get_constant(4), m.fresh_id());
+    Instruction* mul_raw = mul.get();
+    auto add = std::make_unique<BinaryInst>(Opcode::Add, m.get_constant(2), mul_raw, m.fresh_id());
+    Instruction* add_raw = add.get();
+    entry->push_back(std::move(mul));
+    entry->push_back(std::move(add));
+    entry->push_back(std::make_unique<RetInst>(add_raw));
+
+    bool changed = run_optim(m);
+    toyc::test::check(changed, "run_optim: changed");
+    Instruction* term = f->entry()->terminator();
+    toyc::test::check(term->opcode() == Opcode::Ret, "run_optim: ret");
+    toyc::test::check(static_cast<ConstantInt*>(term->operand(0))->value() == 14, "run_optim: 2+3*4 == 14");
+    toyc::test::check(entry->insts().size() == 1, "run_optim: only ret left");
+}
+
 }  // namespace
 
 int main() {
@@ -633,5 +654,6 @@ int main() {
     test_gvn_dominance_scoped();
     test_cfs_folds_const_branch();
     test_cfs_trivial_phi();
+    test_run_optim_fixpoint();
     return toyc::test::report();
 }
