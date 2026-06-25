@@ -9,6 +9,8 @@
 
 因此 codegen 的第一接入点是 `src/driver/main.cpp` 中非 dump 路径的尾部：在 AST 校验和 Sema 成功之后，复用 `toyc::generate(*unit, sema, diagnostics)` 得到 `Module`，然后把 `Module` 翻译为 RISC-V32 汇编写到 `stdout`。
 
+性能目标需要单独看待：评测满分以 gcc -O2 运行时间为基准，朴素栈式 codegen 不足以作为最终 `-opt` 路径。ToyC 没有输入和 I/O，`main` 返回值对整程序是编译期确定值；后续 `-opt` 设计应优先考虑整程序求值/部分求值，再 fallback 到优化 IR + 寄存器化后端。详见 `docs/codegen-O2满分落地参考.md`。
+
 ## 当前模块边界
 
 | 模块 | 入口文件 | 当前状态 | 对 codegen 的意义 |
@@ -129,8 +131,8 @@ bb5:
 - 没有 codegen API、目录、CMake 目标接入。
 - 默认编译路径不产生汇编。
 - `-opt` 被解析但没有优化管线。
+- 没有面向 gcc -O2 满分目标的整程序求值、部分求值或性能基准脚本。
 - 没有 mem2reg、deSSA、寄存器分配、spill、栈帧布局。
 - 没有汇编级 oracle 回归测试脚本。
 - 评测运行机制仍未从代码中体现：`main` 是普通 `ret`，还是 Linux `exit` syscall，需要后续确认。
 - RISC-V 伪指令和段格式的允许范围未在仓库中固化。
-
