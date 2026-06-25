@@ -5,6 +5,8 @@
 #include "toyc/ir.h"
 #include "toyc/irgen.h"
 #include "toyc/lexer.h"
+#include "toyc/mem2reg.h"
+#include "toyc/optim.h"
 #include "toyc/parser.h"
 #include "toyc/riscv.h"
 #include "toyc/sema.h"
@@ -21,6 +23,12 @@
 namespace toyc {
 namespace {
 
+enum class CodegenPipeline {
+    Raw,
+    Mem2Reg,
+    Optim,
+};
+
 Module make_return_const_module(int value) {
     Module module;
     Function* main = module.create_function("main", FuncRet::Int, 0);
@@ -29,7 +37,8 @@ Module make_return_const_module(int value) {
     return module;
 }
 
-std::string compile_source_to_asm(const std::string& source) {
+std::string compile_source_to_asm(const std::string& source,
+                                  CodegenPipeline pipeline = CodegenPipeline::Raw) {
     DiagnosticEngine diagnostics;
     std::istringstream input(source);
     Lexer lexer(input, diagnostics);
@@ -65,8 +74,16 @@ std::string compile_source_to_asm(const std::string& source) {
         return {};
     }
 
+    if (pipeline == CodegenPipeline::Mem2Reg || pipeline == CodegenPipeline::Optim) {
+        mem2reg(*module);
+    }
+    if (pipeline == CodegenPipeline::Optim) {
+        run_optim(*module);
+    }
+
     std::ostringstream out;
     CodegenOptions options;
+    options.opt_mode = pipeline == CodegenPipeline::Optim;
     if (!emit_riscv(*module, options, diagnostics, out)) {
         std::ostringstream d;
         diagnostics.emit_all(d);
@@ -229,9 +246,60 @@ TEST(Codegen, CompilesMoreThanEightArgs) {
         "return a + b + c + d + e + f + g + h + i; } "
         "int main() { return sum9(1,2,3,4,5,6,7,8,9); }\n");
     EXPECT_NE(std::string::npos, asm_text.find("sum9:\n"));
-    EXPECT_NE(std::string::npos, asm_text.find("    lw t1, 112(sp)\n"));
+    EXPECT_NE(std::string::npos, asm_text.find("    sw a0, 4(sp)\n"));
+    EXPECT_NE(std::string::npos, asm_text.find("    lw t1, 144(sp)\n"));
     EXPECT_NE(std::string::npos, asm_text.find("    sw t0, 0(sp)\n"));
     EXPECT_NE(std::string::npos, asm_text.find("    call sum9\n"));
+}
+
+TEST(Codegen, CompilesMem2RegIfElsePhi) {
+    const std::string asm_text = compile_source_to_asm(
+        "int g = 1; int main() { int x = 0; if (g) { x = 1; } else { x = 2; } return x; }\n",
+        CodegenPipeline::Mem2Reg);
+    EXPECT_NE(std::string::npos, asm_text.find(".Lmain_edge_entry_to_bb1:\n"));
+    EXPECT_NE(std::string::npos, asm_text.find("    sw t0, 0(sp)\n"));
+    EXPECT_NE(std::string::npos, asm_text.find("    lw t0, 0(sp)\n"));
+    EXPECT_NE(std::string::npos, asm_text.find("    j .Lmain_bb3\n"));
+    EXPECT_EQ(std::string::npos, asm_text.find("codegen does not support phi"));
+}
+
+TEST(Codegen, CompilesMem2RegLoopHeaderPhi) {
+    const std::string asm_text = compile_source_to_asm(
+        "int main() { int i = 0; int sum = 0; while (i < 4) { "
+        "sum = sum + i; i = i + 1; } return sum; }\n",
+        CodegenPipeline::Mem2Reg);
+    EXPECT_NE(std::string::npos, asm_text.find("    sw t0, 0(sp)\n"));
+    EXPECT_NE(std::string::npos, asm_text.find("    sw t0, 4(sp)\n"));
+    EXPECT_NE(std::string::npos, asm_text.find("    lw t0, 0(sp)\n"));
+    EXPECT_NE(std::string::npos, asm_text.find("    lw t0, 4(sp)\n"));
+    EXPECT_NE(std::string::npos, asm_text.find("    j .Lmain_bb1\n"));
+}
+
+TEST(Codegen, CompilesOptimizedConstantBranch) {
+    const std::string asm_text = compile_source_to_asm(
+        "int main() { int x = 1; if (1) { x = 7; } else { x = 9; } return x; }\n",
+        CodegenPipeline::Optim);
+    EXPECT_NE(std::string::npos, asm_text.find("main:\n"));
+    EXPECT_NE(std::string::npos, asm_text.find(".Lmain_exit:\n"));
+}
+
+TEST(Codegen, CompilesOptimizedSharedValue) {
+    const std::string asm_text = compile_source_to_asm(
+        "int main() { int a = 3; int b = a + 4; int c = a + 4; return b + c; }\n",
+        CodegenPipeline::Optim);
+    EXPECT_NE(std::string::npos, asm_text.find("main:\n"));
+    EXPECT_NE(std::string::npos, asm_text.find("    j .Lmain_exit\n"));
+}
+
+TEST(Codegen, CompilesOptimizedSampleShape) {
+    std::ifstream input("test/sample.tc");
+    ASSERT_TRUE(input.good());
+    std::ostringstream source;
+    source << input.rdbuf();
+    const std::string asm_text = compile_source_to_asm(source.str(), CodegenPipeline::Optim);
+    EXPECT_NE(std::string::npos, asm_text.find("    .section .text\n"));
+    EXPECT_NE(std::string::npos, asm_text.find("    .globl main\n"));
+    EXPECT_NE(std::string::npos, asm_text.find(".Lmain_exit:\n"));
 }
 
 TEST(Codegen, CompilesEndToEndCases) {

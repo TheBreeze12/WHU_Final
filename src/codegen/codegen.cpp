@@ -4,6 +4,7 @@
 #include "toyc/ir.h"
 #include "toyc/riscv.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <ostream>
 #include <sstream>
@@ -42,7 +43,11 @@ public:
     }
     outgoing_arg_size_ = next_offset_;
     for (const std::unique_ptr<BasicBlock> &block : function.blocks()) {
+      int block_phi_count = 0;
       for (const std::unique_ptr<Instruction> &inst : block->insts()) {
+        if (inst->opcode() == Opcode::Phi) {
+          ++block_phi_count;
+        }
         if (inst->opcode() == Opcode::Call) {
           has_call_ = true;
           const unsigned stack_args =
@@ -53,10 +58,21 @@ public:
           }
         }
       }
+      max_phi_count_ = std::max(max_phi_count_, block_phi_count);
     }
     next_offset_ = outgoing_arg_size_;
     if (has_call_) {
       ra_offset_ = next_offset_;
+      next_offset_ += 4;
+    }
+    for (int i = 0; i < max_phi_count_; ++i) {
+      phi_temp_offsets_.push_back(next_offset_);
+      next_offset_ += 4;
+    }
+    const unsigned register_params =
+        static_cast<unsigned>(std::min<std::size_t>(function.params().size(), 8));
+    for (unsigned i = 0; i < register_params; ++i) {
+      param_offsets_.push_back(next_offset_);
       next_offset_ += 4;
     }
     for (const std::unique_ptr<BasicBlock> &block : function.blocks()) {
@@ -76,6 +92,11 @@ public:
   int stack_param_offset(unsigned id) const {
     return frame_size_ + static_cast<int>((id - 8) * 4);
   }
+  bool has_register_param_slot(unsigned id) const {
+    return id < param_offsets_.size();
+  }
+  int register_param_offset(unsigned id) const { return param_offsets_[id]; }
+  int phi_temp_offset(unsigned index) const { return phi_temp_offsets_[index]; }
 
   bool has_slot(const Value *value) const {
     return slots_.find(value) != slots_.end();
@@ -88,10 +109,13 @@ public:
 
 private:
   std::unordered_map<const Value *, int> slots_;
+  std::vector<int> phi_temp_offsets_;
+  std::vector<int> param_offsets_;
   int next_offset_ = 0;
   int outgoing_arg_size_ = 0;
   int ra_offset_ = -1;
   int frame_size_ = 0;
+  int max_phi_count_ = 0;
   bool has_call_ = false;
 };
 
@@ -169,7 +193,7 @@ private:
     case Opcode::Ret:
       return lower_ret(inst);
     case Opcode::Phi:
-      return fail("codegen does not support phi before deSSA");
+      return true;
     }
     return fail("codegen found an unknown instruction");
   }
@@ -292,8 +316,12 @@ private:
         inst.operand(0)->value_kind() != ValueKind::BasicBlock) {
       return fail("malformed br instruction");
     }
-    writer_.inst("j", block_label(function_, *static_cast<const BasicBlock *>(
-                                                 inst.operand(0))));
+    const BasicBlock &target =
+        *static_cast<const BasicBlock *>(inst.operand(0));
+    if (!emit_phi_copies(target, *inst.parent())) {
+      return false;
+    }
+    writer_.inst("j", block_label(function_, target));
     return true;
   }
 
@@ -306,12 +334,70 @@ private:
     if (!load_i32(inst.operand(0), RvReg::T0)) {
       return false;
     }
+    const BasicBlock &true_target =
+        *static_cast<const BasicBlock *>(inst.operand(1));
+    const BasicBlock &false_target =
+        *static_cast<const BasicBlock *>(inst.operand(2));
+    const std::string true_copy_label = edge_copy_label(*inst.parent(), true_target);
     writer_.inst("bne", reg_name(RvReg::T0), reg_name(RvReg::Zero),
-                 block_label(function_, *static_cast<const BasicBlock *>(
-                                            inst.operand(1))));
-    writer_.inst("j", block_label(function_, *static_cast<const BasicBlock *>(
-                                                 inst.operand(2))));
+                 true_copy_label);
+    if (!emit_phi_copies(false_target, *inst.parent())) {
+      return false;
+    }
+    writer_.inst("j", block_label(function_, false_target));
+    writer_.label(true_copy_label);
+    if (!emit_phi_copies(true_target, *inst.parent())) {
+      return false;
+    }
+    writer_.inst("j", block_label(function_, true_target));
     return true;
+  }
+
+  bool emit_phi_copies(const BasicBlock &target, const BasicBlock &predecessor) {
+    unsigned index = 0;
+    for (const std::unique_ptr<Instruction> &inst : target.insts()) {
+      if (inst->opcode() != Opcode::Phi) {
+        break;
+      }
+      const PhiInst &phi = static_cast<const PhiInst &>(*inst);
+      Value *incoming = incoming_for_pred(phi, predecessor);
+      if (!incoming) {
+        return fail("phi missing incoming value for predecessor");
+      }
+      if (!load_i32(incoming, RvReg::T0)) {
+        return false;
+      }
+      writer_.inst("sw", reg_name(RvReg::T0),
+                   offset_addr(frame_.phi_temp_offset(index), RvReg::Sp));
+      ++index;
+    }
+
+    index = 0;
+    for (const std::unique_ptr<Instruction> &inst : target.insts()) {
+      if (inst->opcode() != Opcode::Phi) {
+        break;
+      }
+      writer_.inst("lw", reg_name(RvReg::T0),
+                   offset_addr(frame_.phi_temp_offset(index), RvReg::Sp));
+      writer_.inst("sw", reg_name(RvReg::T0),
+                   offset_addr(frame_.slot_offset(inst.get()), RvReg::Sp));
+      ++index;
+    }
+    return true;
+  }
+
+  Value *incoming_for_pred(const PhiInst &phi, const BasicBlock &predecessor) const {
+    for (unsigned i = 0; i < phi.num_operands(); ++i) {
+      if (phi.incoming_blocks()[i] == &predecessor) {
+        return phi.operand(i);
+      }
+    }
+    return nullptr;
+  }
+
+  std::string edge_copy_label(const BasicBlock &from, const BasicBlock &to) const {
+    return ".L" + function_.short_name() + "_edge_" + from.name() + "_to_" +
+           to.name();
   }
 
   bool lower_call(const Instruction &inst) {
@@ -358,6 +444,10 @@ private:
       writer_.inst("sw", reg_name(RvReg::Ra),
                    offset_addr(frame_.ra_offset(), RvReg::Sp));
     }
+    for (unsigned i = 0; i < function_.params().size() && i < arg_regs_.size(); ++i) {
+      writer_.inst("sw", reg_name(arg_regs_[i]),
+                   offset_addr(frame_.register_param_offset(i), RvReg::Sp));
+    }
   }
 
   void emit_epilogue() {
@@ -392,12 +482,9 @@ private:
     }
     if (value->value_kind() == ValueKind::Param) {
       const unsigned id = value->id();
-      if (id < arg_regs_.size()) {
-        const RvReg source = arg_regs_[id];
-        if (source != dst) {
-          writer_.inst("add", reg_name(dst), reg_name(source),
-                       reg_name(RvReg::Zero));
-        }
+      if (frame_.has_register_param_slot(id)) {
+        writer_.inst("lw", reg_name(dst),
+                     offset_addr(frame_.register_param_offset(id), RvReg::Sp));
         return true;
       }
       writer_.inst("lw", reg_name(dst),

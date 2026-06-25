@@ -86,12 +86,7 @@ int run_frontend(toyc::CompilerOptions options) {
         return 0;
     }
 
-    toyc::CompilerOptions ir_options = options;
-    // Until deSSA lands, -opt reaches codegen through the raw IR shape while
-    // still recording opt intent in CodegenOptions.
-    ir_options.opt_mode = false;
-    ir_options.mem2reg_only = false;
-    std::unique_ptr<toyc::Module> ir = build_ir(*unit, ir_options, diagnostics);
+    std::unique_ptr<toyc::Module> ir = build_ir(*unit, options, diagnostics);
     if (!ir) {
         diagnostics.emit_all(std::cerr);
         return 1;
