@@ -11,6 +11,7 @@
 |----|------|------|--------|------|
 | ISSUE-001 | 契约头文件 | `ast_contract.h::ValueKind` 与 `ir.h::ValueKind` 同名 | 高 | 已修复 |
 | ISSUE-002 | 手动验证 | PowerShell 不支持 Bash 风格 `< input.tc` 重定向 | 低 | 已规避 |
+| ISSUE-003 | ConstEval | 编译期 `&&` / `||` 未遵守短路语义 | 高 | 已修复 |
 
 ---
 
@@ -77,3 +78,69 @@ ctest --test-dir build -C Release --output-on-failure
 ```
 
 结果：Debug / Release 下 `parser_regression`、`ir_tests`、`irgen_regression`、`sema_regression` 全部通过。
+
+---
+
+## ISSUE-003：编译期常量求值未遵守短路语义
+
+### 现象
+
+以下合法常量表达式被误报为编译期除零：
+
+```c
+const int a = 0 && (1 / 0);
+const int b = 1 || (1 / 0);
+```
+
+### 根因
+
+`Analyzer::eval_const_expr()` 在处理所有二元表达式时先统一求出左右操作数，再按操作符计算结果。这个顺序适用于算术和关系运算，但不适用于 `&&` / `||`。
+
+### 补丁
+
+在 `BinaryOp::And` / `BinaryOp::Or` 上提前分支：
+
+- `lhs == 0` 的 `&&` 直接返回 `0`，不求 RHS。
+- `lhs != 0` 的 `||` 直接返回 `1`，不求 RHS。
+- 只有无法短路时才求 RHS，并将 RHS 归一化为 `0/1`。
+
+### 验证
+
+新增回归用例：
+
+- `test/regression/sema/valid/const_short_circuit_and.tc`
+- `test/regression/sema/valid/const_short_circuit_or.tc`
+
+执行以下验证通过：
+
+```powershell
+cmake --build build --config Debug --target toyc-sema-tests
+build\Debug\toyc-sema-tests.exe
+
+cmake --build build --config Debug --target toyc-compiler
+@'
+const int a = 0 && (1 / 0);
+
+int main() {
+    return a;
+}
+'@ | build\Debug\toyc-compiler.exe -dump-ir
+
+@'
+const int a = 1 || (1 / 0);
+
+int main() {
+    return a;
+}
+'@ | build\Debug\toyc-compiler.exe -dump-ir
+```
+
+同时执行既有回归：
+
+```powershell
+build\Debug\toyc-frontend-tests.exe
+build\Debug\toyc-ir-tests.exe
+build\Debug\toyc-codegen-tests.exe
+```
+
+结果全部通过。

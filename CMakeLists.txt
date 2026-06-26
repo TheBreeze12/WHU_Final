@@ -99,6 +99,14 @@ target_include_directories(toyc-ir-tests PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(toyc-ir-tests PRIVATE toyc-core GTest::gtest_main)
 toyc_enable_warnings(toyc-ir-tests)
 
+add_executable(toyc-sema-tests
+    test/support/frontend_fixture.cpp
+    test/sema/sema_tests.cpp
+)
+target_include_directories(toyc-sema-tests PRIVATE test/support)
+target_link_libraries(toyc-sema-tests PRIVATE toyc-core GTest::gtest_main)
+toyc_enable_warnings(toyc-sema-tests)
+
 add_executable(toyc-codegen-tests
     test/codegen/codegen_tests.cpp
 )

@@ -340,18 +340,12 @@ private:
         require_int_expr(*binary.lhs, "left operand");
         require_int_expr(*binary.rhs, "right operand");
         result_.expr_types[&expr] = ExprValueType::Int;
-        if (auto value = eval_const_expr(expr)) {
-            result_.const_values[&expr] = *value;
-        }
         return ExprValueType::Int;
     }
 
     ExprValueType analyze_unary(const Expr& expr, const UnaryExpr& unary) {
         require_int_expr(*unary.operand, "unary operand");
         result_.expr_types[&expr] = ExprValueType::Int;
-        if (auto value = eval_const_expr(expr)) {
-            result_.const_values[&expr] = *value;
-        }
         return ExprValueType::Int;
     }
 
@@ -421,8 +415,25 @@ private:
             }
             case Expr::Kind::Binary: {
                 auto lhs = eval_const_expr(*expr.binary.lhs);
+                if (!lhs) {
+                    return std::nullopt;
+                }
+                if (expr.binary.op == BinaryOp::And) {
+                    if (*lhs == 0) {
+                        return 0;
+                    }
+                    auto rhs = eval_const_expr(*expr.binary.rhs);
+                    return rhs ? static_cast<int>(*rhs != 0) : std::optional<int>{};
+                }
+                if (expr.binary.op == BinaryOp::Or) {
+                    if (*lhs != 0) {
+                        return 1;
+                    }
+                    auto rhs = eval_const_expr(*expr.binary.rhs);
+                    return rhs ? static_cast<int>(*rhs != 0) : std::optional<int>{};
+                }
                 auto rhs = eval_const_expr(*expr.binary.rhs);
-                if (!lhs || !rhs) {
+                if (!rhs) {
                     return std::nullopt;
                 }
                 switch (expr.binary.op) {
@@ -457,9 +468,8 @@ private:
                     case BinaryOp::Ne:
                         return *lhs != *rhs;
                     case BinaryOp::And:
-                        return (*lhs != 0) && (*rhs != 0);
                     case BinaryOp::Or:
-                        return (*lhs != 0) || (*rhs != 0);
+                        return std::nullopt;
                 }
                 return std::nullopt;
             }
