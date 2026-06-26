@@ -361,9 +361,7 @@ private:
     if (!emit_phi_copies(false_target, *inst.parent())) {
       return false;
     }
-    if (!is_fallthrough(*inst.parent(), false_target)) {
-      writer_.inst("j", block_label(function_, false_target));
-    }
+    writer_.inst("j", block_label(function_, false_target));
     writer_.label(true_copy_label);
     if (!emit_phi_copies(true_target, *inst.parent())) {
       return false;
@@ -422,9 +420,7 @@ private:
     if (!emit_phi_copies(false_target, *branch.parent())) {
       return false;
     }
-    if (!is_fallthrough(*branch.parent(), false_target)) {
-      writer_.inst("j", block_label(function_, false_target));
-    }
+    writer_.inst("j", block_label(function_, false_target));
     writer_.label(true_copy_label);
     if (!emit_phi_copies(true_target, *branch.parent())) {
       return false;

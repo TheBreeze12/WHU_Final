@@ -202,6 +202,17 @@ TEST(Codegen, CompilesDivRemAndShortCircuit) {
     EXPECT_NE(std::string::npos, asm_text.find("    sltu t2, x0, t2\n"));
 }
 
+TEST(Codegen, CompilesOrFalseEdgeBeforeTrueEdgeCopy) {
+    const std::string asm_text = compile_source_to_asm(
+        "int g = 0; int side() { g = g + 1; return g; } "
+        "int main() { if (0 || side()) { } return g; }\n");
+    EXPECT_NE(std::string::npos,
+              asm_text.find("    bne t0, t1, .Lmain_edge_entry_to_bb2\n"
+                            "    j .Lmain_bb1\n"
+                            ".Lmain_edge_entry_to_bb2:\n"));
+    EXPECT_NE(std::string::npos, asm_text.find(".Lmain_bb1:\n    call side\n"));
+}
+
 TEST(Codegen, CompilesRuntimeNegation) {
     const std::string asm_text = compile_source_to_asm(
         "int main() { int x = 9; return -x; }\n");
