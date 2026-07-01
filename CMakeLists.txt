@@ -1,4 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
+
+# Default to an optimized build when the caller (e.g. the judge) does not pick a
+# type. The compile-time whole-program evaluator is interpretive, so an -O0 build
+# would be far slower and could hit the judge's compile-time limit.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 project(toyc-compiler LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)

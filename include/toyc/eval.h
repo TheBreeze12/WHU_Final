@@ -9,11 +9,12 @@ namespace toyc {
 struct CompUnit;
 struct SemaResult;
 
-// Budget guarding the whole-program compile-time evaluator. Compile time is not
-// scored, but we still bound work so pathological programs fall back to real
-// codegen instead of hanging the compiler.
+// Budget guarding the whole-program compile-time evaluator. The judge enforces a
+// compile-time limit, so the wall-clock deadline is the primary guard: when the
+// evaluator cannot finish quickly it must bail out and let real codegen run.
 struct EvalBudget {
-    std::uint64_t max_steps = 800'000'000;
+    std::uint64_t max_steps = 2'000'000'000;
+    unsigned max_millis = 1500;  // wall-clock budget; dominant guard
     unsigned max_call_depth = 3000;
     std::size_t max_memo_entries = 4'000'000;
 };
