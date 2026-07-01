@@ -5,6 +5,8 @@
 
 #include <chrono>
 #include <cstdint>
+#include <deque>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -28,7 +30,7 @@ struct EvalAbort {};
 
 enum class Flow { Normal, Break, Continue, Return, TailCall };
 
-// Storage location of a declaration, resolved once in the pre-pass. Locals and
+// Storage location of a declaration, resolved once at compile time. Locals and
 // params index into the current call frame's flat vector; globals index into the
 // shared global vector. Flat indexing avoids per-access hashing in hot loops.
 struct VarLoc {
@@ -37,6 +39,48 @@ struct VarLoc {
 };
 
 using Frame = std::vector<i32>;
+
+struct CFunc;
+
+// ---- compiled (resolved) expression / statement trees --------------------
+//
+// The AST is walked once and lowered into these nodes with every identifier,
+// assignment target and call site pre-resolved. Execution then touches no hash
+// maps, which is what makes tight loops fast enough to fold within budget.
+
+struct CExpr {
+    enum class Kind { Const, Load, Binary, Unary, And, Or, Call };
+    Kind kind = Kind::Const;
+    i32 const_value = 0;       // Const
+    VarLoc loc;                // Load
+    BinaryOp bop = BinaryOp::Add;   // Binary
+    UnaryOp uop = UnaryOp::Plus;    // Unary
+    const CExpr* a = nullptr;  // Binary/And/Or lhs, Unary operand
+    const CExpr* b = nullptr;  // Binary/And/Or rhs
+    const CFunc* callee = nullptr;   // Call
+    std::vector<const CExpr*> args;  // Call
+};
+
+struct CStmt {
+    enum class Kind {
+        Block, ExprStmt, Assign, If, While, Break, Continue, Return, TailCall
+    };
+    Kind kind = Kind::Block;
+    std::vector<const CStmt*> body;   // Block
+    const CExpr* expr = nullptr;      // ExprStmt/Assign value/If cond/While cond/Return value
+    VarLoc loc;                       // Assign target
+    const CStmt* then_stmt = nullptr; // If then
+    const CStmt* else_stmt = nullptr; // If else
+    const CStmt* while_body = nullptr;// While body
+    std::vector<const CExpr*> tail_args;  // TailCall
+};
+
+struct CFunc {
+    const FuncDef* fn = nullptr;
+    std::uint32_t frame_size = 0;
+    const CStmt* body = nullptr;
+    bool pure = false;
+};
 
 struct MemoKey {
     const FuncDef* fn;
@@ -65,12 +109,22 @@ public:
         deadline_ = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds(budget_.max_millis);
         try {
-            prepass();
-            const FuncDef* main = find_main();
-            if (!main || !main->body) {
+            if (!prepass()) {
                 return std::nullopt;
             }
             classify_purity();
+            if (!compile_all()) {
+                return std::nullopt;
+            }
+            // Evaluate global initializers in declaration order.
+            Frame empty;
+            for (const auto& [index, init] : global_inits_) {
+                globals_[index] = eval_expr(*init, empty);
+            }
+            const CFunc* main = find_main();
+            if (!main || !main->body) {
+                return std::nullopt;
+            }
             std::vector<i32> no_args;
             return call_function(*main, std::move(no_args));
         } catch (const EvalAbort&) {
@@ -80,8 +134,6 @@ public:
 
 private:
     inline void tick() {
-        // Check the wall clock / step ceiling only periodically to keep the hot
-        // path cheap.
         if ((++steps_ & 0xFFFFu) == 0) {
             if (steps_ > budget_.max_steps ||
                 std::chrono::steady_clock::now() > deadline_) {
@@ -90,27 +142,24 @@ private:
         }
     }
 
-    // ---- pre-pass: assign flat storage slots and evaluate global inits -----
+    // ---- pre-pass: assign flat storage slots ------------------------------
 
-    void prepass() {
-        Frame empty;
+    bool prepass() {
         std::uint32_t gidx = 0;
         for (const CompUnit::Item& item : unit_.items) {
             switch (item.kind) {
-                case CompUnit::ItemKind::GlobalConst: {
+                case CompUnit::ItemKind::GlobalConst:
                     loc_[&item.global_const] = VarLoc{true, gidx};
                     globals_.push_back(0);
-                    globals_[gidx] = eval_expr(*item.global_const.init, empty);
+                    global_init_ast_.push_back({gidx, item.global_const.init.get()});
                     ++gidx;
                     break;
-                }
-                case CompUnit::ItemKind::GlobalVar: {
+                case CompUnit::ItemKind::GlobalVar:
                     loc_[&item.global_var] = VarLoc{true, gidx};
                     globals_.push_back(0);
-                    globals_[gidx] = eval_expr(*item.global_var.init, empty);
+                    global_init_ast_.push_back({gidx, item.global_var.init.get()});
                     ++gidx;
                     break;
-                }
                 case CompUnit::ItemKind::FuncDef: {
                     const FuncDef& fn = item.func_def;
                     functions_[fn.name] = &fn;
@@ -126,6 +175,7 @@ private:
                 }
             }
         }
+        return true;
     }
 
     void collect_locals_block(const BlockStmt& block, std::uint32_t& idx) {
@@ -159,11 +209,6 @@ private:
             default:
                 break;
         }
-    }
-
-    const FuncDef* find_main() const {
-        auto it = functions_.find("main");
-        return it == functions_.end() ? nullptr : it->second;
     }
 
     // ---- purity analysis (for memoization) --------------------------------
@@ -269,8 +314,6 @@ private:
             infos.emplace(fn, std::move(info));
         }
 
-        // Start optimistic (pure unless it touches a global var), then propagate
-        // impurity across call edges to a fixed point.
         for (const auto& [fn, info] : infos) {
             pure_[fn] = !info.touches_global_var;
         }
@@ -293,64 +336,259 @@ private:
         }
     }
 
+    // ---- compilation: AST -> resolved CExpr/CStmt -------------------------
+
+    bool compile_all() {
+        // Create a CFunc for every function first so calls can resolve targets.
+        for (const CompUnit::Item& item : unit_.items) {
+            if (item.kind != CompUnit::ItemKind::FuncDef) {
+                continue;
+            }
+            const FuncDef& fn = item.func_def;
+            CFunc& cfunc = cfuncs_.emplace_back();
+            cfunc.fn = &fn;
+            cfunc.frame_size = frame_size_[&fn];
+            cfunc.pure = is_pure(&fn);
+            cfunc_by_def_[&fn] = &cfunc;
+        }
+        // Now compile bodies and global initializers.
+        for (CFunc& cfunc : cfuncs_) {
+            current_compile_fn_ = cfunc.fn;
+            if (cfunc.fn->body) {
+                cfunc.body = compile_block(*cfunc.fn->body);
+            }
+        }
+        current_compile_fn_ = nullptr;
+        for (const auto& [index, ast] : global_init_ast_) {
+            const CExpr* init = compile_expr(*ast);
+            global_inits_.push_back({index, init});
+        }
+        return true;
+    }
+
+    VarLoc lookup_loc(const void* decl) {
+        auto it = loc_.find(decl);
+        if (it == loc_.end()) {
+            throw EvalAbort{};
+        }
+        return it->second;
+    }
+
+    CExpr* new_expr_mut() {
+        cexprs_.emplace_back();
+        return &cexprs_.back();
+    }
+    CStmt* new_stmt() {
+        cstmts_.emplace_back();
+        return &cstmts_.back();
+    }
+
+    const CExpr* compile_expr(const Expr& expr) {
+        switch (expr.kind) {
+            case Expr::Kind::IntLiteral: {
+                CExpr* c = new_expr_mut();
+                c->kind = CExpr::Kind::Const;
+                c->const_value = static_cast<i32>(expr.int_literal.value);
+                return c;
+            }
+            case Expr::Kind::Ident: {
+                auto it = sema_.idents.find(&expr.ident);
+                if (it == sema_.idents.end()) {
+                    throw EvalAbort{};
+                }
+                CExpr* c = new_expr_mut();
+                c->kind = CExpr::Kind::Load;
+                c->loc = lookup_loc(it->second.decl);
+                return c;
+            }
+            case Expr::Kind::Binary: {
+                CExpr* c = new_expr_mut();
+                if (expr.binary.op == BinaryOp::And) {
+                    c->kind = CExpr::Kind::And;
+                } else if (expr.binary.op == BinaryOp::Or) {
+                    c->kind = CExpr::Kind::Or;
+                } else {
+                    c->kind = CExpr::Kind::Binary;
+                    c->bop = expr.binary.op;
+                }
+                c->a = compile_expr(*expr.binary.lhs);
+                c->b = compile_expr(*expr.binary.rhs);
+                return c;
+            }
+            case Expr::Kind::Unary: {
+                CExpr* c = new_expr_mut();
+                c->kind = CExpr::Kind::Unary;
+                c->uop = expr.unary.op;
+                c->a = compile_expr(*expr.unary.operand);
+                return c;
+            }
+            case Expr::Kind::Call: {
+                auto it = sema_.calls.find(&expr.call);
+                if (it == sema_.calls.end() || !it->second || !it->second->body) {
+                    throw EvalAbort{};
+                }
+                auto cf = cfunc_by_def_.find(it->second);
+                if (cf == cfunc_by_def_.end()) {
+                    throw EvalAbort{};
+                }
+                CExpr* c = new_expr_mut();
+                c->kind = CExpr::Kind::Call;
+                c->callee = cf->second;
+                c->args.reserve(expr.call.args.size());
+                for (const std::unique_ptr<Expr>& arg : expr.call.args) {
+                    c->args.push_back(compile_expr(*arg));
+                }
+                return c;
+            }
+        }
+        throw EvalAbort{};
+    }
+
+    const CStmt* compile_block(const BlockStmt& block) {
+        CStmt* s = new_stmt();
+        s->kind = CStmt::Kind::Block;
+        for (const std::unique_ptr<Stmt>& stmt : block.body) {
+            if (stmt) {
+                s->body.push_back(compile_stmt(*stmt));
+            }
+        }
+        return s;
+    }
+
+    const CStmt* compile_stmt(const Stmt& stmt) {
+        switch (stmt.kind) {
+            case Stmt::Kind::Block:
+                return compile_block(stmt.block);
+            case Stmt::Kind::Empty: {
+                CStmt* s = new_stmt();
+                s->kind = CStmt::Kind::Block;  // empty block == no-op
+                return s;
+            }
+            case Stmt::Kind::Expr: {
+                CStmt* s = new_stmt();
+                s->kind = CStmt::Kind::ExprStmt;
+                s->expr = compile_expr(*stmt.expr.expr);
+                return s;
+            }
+            case Stmt::Kind::Assign: {
+                auto it = sema_.assigns.find(&stmt.assign);
+                if (it == sema_.assigns.end()) {
+                    throw EvalAbort{};
+                }
+                CStmt* s = new_stmt();
+                s->kind = CStmt::Kind::Assign;
+                s->loc = lookup_loc(it->second.decl);
+                s->expr = compile_expr(*stmt.assign.value);
+                return s;
+            }
+            case Stmt::Kind::ConstDecl: {
+                CStmt* s = new_stmt();
+                s->kind = CStmt::Kind::Assign;
+                s->loc = lookup_loc(&stmt.const_decl);
+                s->expr = compile_expr(*stmt.const_decl.init);
+                return s;
+            }
+            case Stmt::Kind::VarDecl: {
+                CStmt* s = new_stmt();
+                s->kind = CStmt::Kind::Assign;
+                s->loc = lookup_loc(&stmt.var_decl);
+                s->expr = compile_expr(*stmt.var_decl.init);
+                return s;
+            }
+            case Stmt::Kind::If: {
+                CStmt* s = new_stmt();
+                s->kind = CStmt::Kind::If;
+                s->expr = compile_expr(*stmt.if_stmt.condition);
+                s->then_stmt = compile_stmt(*stmt.if_stmt.then_branch);
+                if (stmt.if_stmt.else_branch) {
+                    s->else_stmt = compile_stmt(*stmt.if_stmt.else_branch);
+                }
+                return s;
+            }
+            case Stmt::Kind::While: {
+                CStmt* s = new_stmt();
+                s->kind = CStmt::Kind::While;
+                s->expr = compile_expr(*stmt.while_stmt.condition);
+                s->while_body = compile_stmt(*stmt.while_stmt.body);
+                return s;
+            }
+            case Stmt::Kind::Break: {
+                CStmt* s = new_stmt();
+                s->kind = CStmt::Kind::Break;
+                return s;
+            }
+            case Stmt::Kind::Continue: {
+                CStmt* s = new_stmt();
+                s->kind = CStmt::Kind::Continue;
+                return s;
+            }
+            case Stmt::Kind::Return: {
+                CStmt* s = new_stmt();
+                if (!stmt.return_stmt.value) {
+                    s->kind = CStmt::Kind::Return;
+                    return s;
+                }
+                const Expr& value = **stmt.return_stmt.value;
+                // Self tail call: `return self(...)` becomes a loop in
+                // call_function so linear self-recursion cannot exhaust the stack.
+                if (value.kind == Expr::Kind::Call) {
+                    auto it = sema_.calls.find(&value.call);
+                    if (it != sema_.calls.end() && it->second == current_compile_fn_) {
+                        s->kind = CStmt::Kind::TailCall;
+                        s->tail_args.reserve(value.call.args.size());
+                        for (const std::unique_ptr<Expr>& arg : value.call.args) {
+                            s->tail_args.push_back(compile_expr(*arg));
+                        }
+                        return s;
+                    }
+                }
+                s->kind = CStmt::Kind::Return;
+                s->expr = compile_expr(value);
+                return s;
+            }
+        }
+        throw EvalAbort{};
+    }
+
+    const CFunc* find_main() const {
+        auto it = functions_.find("main");
+        if (it == functions_.end()) {
+            return nullptr;
+        }
+        auto cf = cfunc_by_def_.find(it->second);
+        return cf == cfunc_by_def_.end() ? nullptr : cf->second;
+    }
+
     bool is_pure(const FuncDef* fn) const {
         auto it = pure_.find(fn);
         return it != pure_.end() && it->second;
     }
 
-    // ---- variable access ---------------------------------------------------
-
-    i32 load_var(const void* decl, Frame& frame) {
-        auto it = loc_.find(decl);
-        if (it == loc_.end()) {
-            throw EvalAbort{};
-        }
-        return it->second.global ? globals_[it->second.index]
-                                 : frame[it->second.index];
-    }
-
-    void store_var(const void* decl, Frame& frame, i32 value) {
-        auto it = loc_.find(decl);
-        if (it == loc_.end()) {
-            throw EvalAbort{};
-        }
-        if (it->second.global) {
-            globals_[it->second.index] = value;
-        } else {
-            frame[it->second.index] = value;
-        }
-    }
-
     // ---- execution ---------------------------------------------------------
 
-    i32 call_function(const FuncDef& fn, std::vector<i32> args) {
+    i32 call_function(const CFunc& cfunc, std::vector<i32> args) {
         if (++depth_ > budget_.max_call_depth) {
             throw EvalAbort{};
         }
-        const bool pure = is_pure(&fn);
+        const bool pure = cfunc.pure;
         if (pure) {
-            auto it = memo_.find(MemoKey{&fn, args});
+            auto it = memo_.find(MemoKey{cfunc.fn, args});
             if (it != memo_.end()) {
                 --depth_;
                 return it->second;
             }
         }
-        const std::vector<i32> memo_args = pure ? args : std::vector<i32>{};
+        std::vector<i32> memo_args = pure ? args : std::vector<i32>{};
 
-        std::uint32_t size = static_cast<std::uint32_t>(fn.params.size());
-        if (auto it = frame_size_.find(&fn); it != frame_size_.end()) {
-            size = it->second;
-        }
-
+        const std::size_t nparams = cfunc.fn->params.size();
         i32 result = 0;
         while (true) {  // loop instead of recursing on self tail calls
-            Frame frame(size, 0);
-            for (std::size_t i = 0; i < fn.params.size() && i < args.size(); ++i) {
+            Frame frame(cfunc.frame_size, 0);
+            for (std::size_t i = 0; i < nparams && i < args.size(); ++i) {
                 frame[i] = args[i];
             }
-            current_fn_ = &fn;
             i32 return_slot = 0;
-            Flow flow = exec_block(*fn.body, frame, return_slot);
+            Flow flow = exec_stmt(*cfunc.body, frame, return_slot);
             if (flow == Flow::TailCall) {
                 args = std::move(tail_args_);
                 continue;
@@ -360,65 +598,47 @@ private:
         }
 
         if (pure && memo_.size() < budget_.max_memo_entries) {
-            memo_.emplace(MemoKey{&fn, memo_args}, result);
+            memo_.emplace(MemoKey{cfunc.fn, std::move(memo_args)}, result);
         }
         --depth_;
         return result;
     }
 
-    Flow exec_block(const BlockStmt& block, Frame& frame, i32& return_slot) {
-        for (const std::unique_ptr<Stmt>& stmt : block.body) {
-            if (!stmt) {
-                continue;
-            }
-            Flow flow = exec_stmt(*stmt, frame, return_slot);
-            if (flow != Flow::Normal) {
-                return flow;
-            }
-        }
-        return Flow::Normal;
-    }
-
-    Flow exec_stmt(const Stmt& stmt, Frame& frame, i32& return_slot) {
+    Flow exec_stmt(const CStmt& stmt, Frame& frame, i32& return_slot) {
         tick();
         switch (stmt.kind) {
-            case Stmt::Kind::Block:
-                return exec_block(stmt.block, frame, return_slot);
-            case Stmt::Kind::Empty:
-                return Flow::Normal;
-            case Stmt::Kind::Expr:
-                eval_expr(*stmt.expr.expr, frame);
-                return Flow::Normal;
-            case Stmt::Kind::Assign: {
-                i32 value = eval_expr(*stmt.assign.value, frame);
-                auto it = sema_.assigns.find(&stmt.assign);
-                if (it == sema_.assigns.end()) {
-                    throw EvalAbort{};
+            case CStmt::Kind::Block:
+                for (const CStmt* child : stmt.body) {
+                    Flow flow = exec_stmt(*child, frame, return_slot);
+                    if (flow != Flow::Normal) {
+                        return flow;
+                    }
                 }
-                store_var(it->second.decl, frame, value);
                 return Flow::Normal;
-            }
-            case Stmt::Kind::ConstDecl:
-                store_var(&stmt.const_decl, frame,
-                          eval_expr(*stmt.const_decl.init, frame));
+            case CStmt::Kind::ExprStmt:
+                eval_expr(*stmt.expr, frame);
                 return Flow::Normal;
-            case Stmt::Kind::VarDecl:
-                store_var(&stmt.var_decl, frame,
-                          eval_expr(*stmt.var_decl.init, frame));
-                return Flow::Normal;
-            case Stmt::Kind::If: {
-                if (eval_expr(*stmt.if_stmt.condition, frame) != 0) {
-                    return exec_stmt(*stmt.if_stmt.then_branch, frame, return_slot);
-                }
-                if (stmt.if_stmt.else_branch) {
-                    return exec_stmt(*stmt.if_stmt.else_branch, frame, return_slot);
+            case CStmt::Kind::Assign: {
+                i32 value = eval_expr(*stmt.expr, frame);
+                if (stmt.loc.global) {
+                    globals_[stmt.loc.index] = value;
+                } else {
+                    frame[stmt.loc.index] = value;
                 }
                 return Flow::Normal;
             }
-            case Stmt::Kind::While: {
-                while (eval_expr(*stmt.while_stmt.condition, frame) != 0) {
+            case CStmt::Kind::If:
+                if (eval_expr(*stmt.expr, frame) != 0) {
+                    return exec_stmt(*stmt.then_stmt, frame, return_slot);
+                }
+                if (stmt.else_stmt) {
+                    return exec_stmt(*stmt.else_stmt, frame, return_slot);
+                }
+                return Flow::Normal;
+            case CStmt::Kind::While:
+                while (eval_expr(*stmt.expr, frame) != 0) {
                     tick();
-                    Flow flow = exec_stmt(*stmt.while_stmt.body, frame, return_slot);
+                    Flow flow = exec_stmt(*stmt.while_body, frame, return_slot);
                     if (flow == Flow::Break) {
                         break;
                     }
@@ -430,76 +650,76 @@ private:
                     }
                 }
                 return Flow::Normal;
-            }
-            case Stmt::Kind::Break:
+            case CStmt::Kind::Break:
                 return Flow::Break;
-            case Stmt::Kind::Continue:
+            case CStmt::Kind::Continue:
                 return Flow::Continue;
-            case Stmt::Kind::Return: {
-                if (!stmt.return_stmt.value) {
-                    return Flow::Return;
+            case CStmt::Kind::Return:
+                if (stmt.expr) {
+                    return_slot = eval_expr(*stmt.expr, frame);
                 }
-                const Expr& value = **stmt.return_stmt.value;
-                // Self tail call: `return self(...)` runs as a loop in
-                // call_function so linear self-recursion cannot exhaust the stack.
-                if (value.kind == Expr::Kind::Call) {
-                    auto it = sema_.calls.find(&value.call);
-                    if (it != sema_.calls.end() && it->second == current_fn_) {
-                        std::vector<i32> args;
-                        args.reserve(value.call.args.size());
-                        for (const std::unique_ptr<Expr>& arg : value.call.args) {
-                            args.push_back(eval_expr(*arg, frame));
-                        }
-                        tail_args_ = std::move(args);
-                        return Flow::TailCall;
-                    }
-                }
-                return_slot = eval_expr(value, frame);
                 return Flow::Return;
+            case CStmt::Kind::TailCall: {
+                std::vector<i32> args;
+                args.reserve(stmt.tail_args.size());
+                for (const CExpr* arg : stmt.tail_args) {
+                    args.push_back(eval_expr(*arg, frame));
+                }
+                tail_args_ = std::move(args);
+                return Flow::TailCall;
             }
         }
         return Flow::Normal;
     }
 
-    i32 eval_expr(const Expr& expr, Frame& frame) {
+    i32 eval_expr(const CExpr& expr, Frame& frame) {
         tick();
         switch (expr.kind) {
-            case Expr::Kind::IntLiteral:
-                return static_cast<i32>(expr.int_literal.value);
-            case Expr::Kind::Ident: {
-                auto it = sema_.idents.find(&expr.ident);
-                if (it == sema_.idents.end()) {
-                    throw EvalAbort{};
+            case CExpr::Kind::Const:
+                return expr.const_value;
+            case CExpr::Kind::Load:
+                return expr.loc.global ? globals_[expr.loc.index]
+                                       : frame[expr.loc.index];
+            case CExpr::Kind::And:
+                return (eval_expr(*expr.a, frame) != 0 &&
+                        eval_expr(*expr.b, frame) != 0)
+                           ? 1
+                           : 0;
+            case CExpr::Kind::Or:
+                return (eval_expr(*expr.a, frame) != 0 ||
+                        eval_expr(*expr.b, frame) != 0)
+                           ? 1
+                           : 0;
+            case CExpr::Kind::Binary:
+                return eval_binary(expr, frame);
+            case CExpr::Kind::Unary: {
+                const i32 value = eval_expr(*expr.a, frame);
+                switch (expr.uop) {
+                    case UnaryOp::Plus:
+                        return value;
+                    case UnaryOp::Minus:
+                        return wrap32(-static_cast<i64>(value));
+                    case UnaryOp::Not:
+                        return value == 0 ? 1 : 0;
                 }
-                return load_var(it->second.decl, frame);
+                throw EvalAbort{};
             }
-            case Expr::Kind::Binary:
-                return eval_binary(expr.binary, frame);
-            case Expr::Kind::Unary:
-                return eval_unary(expr.unary, frame);
-            case Expr::Kind::Call:
-                return eval_call(expr.call, frame);
+            case CExpr::Kind::Call: {
+                std::vector<i32> args;
+                args.reserve(expr.args.size());
+                for (const CExpr* arg : expr.args) {
+                    args.push_back(eval_expr(*arg, frame));
+                }
+                return call_function(*expr.callee, std::move(args));
+            }
         }
         throw EvalAbort{};
     }
 
-    i32 eval_binary(const BinaryExpr& binary, Frame& frame) {
-        if (binary.op == BinaryOp::And) {
-            return (eval_expr(*binary.lhs, frame) != 0 &&
-                    eval_expr(*binary.rhs, frame) != 0)
-                       ? 1
-                       : 0;
-        }
-        if (binary.op == BinaryOp::Or) {
-            return (eval_expr(*binary.lhs, frame) != 0 ||
-                    eval_expr(*binary.rhs, frame) != 0)
-                       ? 1
-                       : 0;
-        }
-
-        const i32 lhs = eval_expr(*binary.lhs, frame);
-        const i32 rhs = eval_expr(*binary.rhs, frame);
-        switch (binary.op) {
+    i32 eval_binary(const CExpr& expr, Frame& frame) {
+        const i32 lhs = eval_expr(*expr.a, frame);
+        const i32 rhs = eval_expr(*expr.b, frame);
+        switch (expr.bop) {
             case BinaryOp::Add:
                 return wrap32(static_cast<i64>(lhs) + rhs);
             case BinaryOp::Sub:
@@ -530,36 +750,9 @@ private:
                 return lhs != rhs ? 1 : 0;
             case BinaryOp::And:
             case BinaryOp::Or:
-                break;  // handled above
+                break;  // handled via CExpr::Kind::And/Or
         }
         throw EvalAbort{};
-    }
-
-    i32 eval_unary(const UnaryExpr& unary, Frame& frame) {
-        const i32 value = eval_expr(*unary.operand, frame);
-        switch (unary.op) {
-            case UnaryOp::Plus:
-                return value;
-            case UnaryOp::Minus:
-                return wrap32(-static_cast<i64>(value));
-            case UnaryOp::Not:
-                return value == 0 ? 1 : 0;
-        }
-        throw EvalAbort{};
-    }
-
-    i32 eval_call(const CallExpr& call, Frame& frame) {
-        auto it = sema_.calls.find(&call);
-        if (it == sema_.calls.end() || !it->second || !it->second->body) {
-            throw EvalAbort{};
-        }
-        const FuncDef& callee = *it->second;
-        std::vector<i32> args;
-        args.reserve(call.args.size());
-        for (const std::unique_ptr<Expr>& arg : call.args) {
-            args.push_back(eval_expr(*arg, frame));
-        }
-        return call_function(callee, std::move(args));
     }
 
     const CompUnit& unit_;
@@ -569,11 +762,20 @@ private:
     std::unordered_map<std::string, const FuncDef*> functions_;
     std::unordered_map<const void*, VarLoc> loc_;
     std::unordered_map<const FuncDef*, std::uint32_t> frame_size_;
-    std::vector<i32> globals_;
     std::unordered_map<const FuncDef*, bool> pure_;
+
+    std::deque<CExpr> cexprs_;
+    std::deque<CStmt> cstmts_;
+    std::deque<CFunc> cfuncs_;
+    std::unordered_map<const FuncDef*, const CFunc*> cfunc_by_def_;
+    const FuncDef* current_compile_fn_ = nullptr;
+
+    std::vector<std::pair<std::uint32_t, const Expr*>> global_init_ast_;
+    std::vector<std::pair<std::uint32_t, const CExpr*>> global_inits_;
+
+    std::vector<i32> globals_;
     std::unordered_map<MemoKey, i32, MemoKeyHash> memo_;
 
-    const FuncDef* current_fn_ = nullptr;
     std::vector<i32> tail_args_;
     std::uint64_t steps_ = 0;
     unsigned depth_ = 0;
