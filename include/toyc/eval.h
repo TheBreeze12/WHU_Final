@@ -14,7 +14,7 @@ struct SemaResult;
 // evaluator cannot finish quickly it must bail out and let real codegen run.
 struct EvalBudget {
     std::uint64_t max_steps = 4'000'000'000;
-    unsigned max_millis = 8000;  // wall-clock budget; dominant guard
+    unsigned max_millis = 15000;  // wall-clock budget; dominant guard
     unsigned max_call_depth = 3000;
     std::size_t max_memo_entries = 4'000'000;
 };
