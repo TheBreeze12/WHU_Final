@@ -326,6 +326,146 @@ bool constprop(Function& fn) {
     }
     return changed;
 }
+
+bool algebraic_simplify(Function& fn) {
+    std::unordered_set<Instruction*> dead;
+    for (const std::unique_ptr<BasicBlock>& owner : fn.blocks()) {
+        for (const std::unique_ptr<Instruction>& inst_owner : owner->insts()) {
+            Instruction* inst = inst_owner.get();
+            Value* replacement = nullptr;
+            auto constant_value = [](Value* value) -> std::optional<int> {
+                if (value->value_kind() != ValueKind::Constant) return std::nullopt;
+                return static_cast<ConstantInt*>(value)->value();
+            };
+
+            if (inst->num_operands() == 2) {
+                Value* lhs = inst->operand(0);
+                Value* rhs = inst->operand(1);
+                const std::optional<int> left = constant_value(lhs);
+                const std::optional<int> right = constant_value(rhs);
+                switch (inst->opcode()) {
+                    case Opcode::Add:
+                        if (right == 0) replacement = lhs;
+                        else if (left == 0) replacement = rhs;
+                        break;
+                    case Opcode::Sub:
+                        if (right == 0) replacement = lhs;
+                        else if (lhs == rhs) replacement = fn.module()->get_constant(0);
+                        break;
+                    case Opcode::Mul:
+                        if (right == 0 || left == 0) replacement = fn.module()->get_constant(0);
+                        else if (right == 1) replacement = lhs;
+                        else if (left == 1) replacement = rhs;
+                        break;
+                    case Opcode::Sdiv:
+                        if (right == 1) replacement = lhs;
+                        break;
+                    case Opcode::Srem:
+                        if (right == 1) replacement = fn.module()->get_constant(0);
+                        break;
+                    case Opcode::ICmpEq:
+                    case Opcode::ICmpSle:
+                    case Opcode::ICmpSge:
+                        if (lhs == rhs) replacement = fn.module()->get_constant(1);
+                        break;
+                    case Opcode::ICmpNe:
+                    case Opcode::ICmpSlt:
+                    case Opcode::ICmpSgt:
+                        if (lhs == rhs) replacement = fn.module()->get_constant(0);
+                        break;
+                    default:
+                        break;
+                }
+            } else if (inst->opcode() == Opcode::Neg && inst->num_operands() == 1) {
+                Instruction* operand = dynamic_cast<Instruction*>(inst->operand(0));
+                if (operand && operand->opcode() == Opcode::Neg) {
+                    replacement = operand->operand(0);
+                }
+            }
+
+            if (replacement && replacement != inst) {
+                inst->replace_all_uses_with(replacement);
+                dead.insert(inst);
+            }
+        }
+    }
+    if (dead.empty()) return false;
+    erase_dead(fn, dead);
+    return true;
+}
+
+bool eliminate_tail_recursion(Function& fn) {
+    struct TailSite {
+        BasicBlock* block;
+        CallInst* call;
+    };
+    std::vector<TailSite> sites;
+    for (const std::unique_ptr<BasicBlock>& owner : fn.blocks()) {
+        BasicBlock* block = owner.get();
+        std::list<std::unique_ptr<Instruction>>& insts = block->insts();
+        if (insts.size() < 2) continue;
+        auto ret_it = std::prev(insts.end());
+        auto call_it = std::prev(ret_it);
+        Instruction* ret = ret_it->get();
+        Instruction* candidate = call_it->get();
+        if (ret->opcode() != Opcode::Ret || candidate->opcode() != Opcode::Call) continue;
+        CallInst* call = static_cast<CallInst*>(candidate);
+        if (call->callee_name() != fn.short_name() ||
+            call->num_operands() != fn.params().size()) continue;
+
+        const bool int_tail = fn.ret_type() == FuncRet::Int && call->has_result() &&
+                              ret->num_operands() == 1 && ret->operand(0) == call &&
+                              call->uses().size() == 1;
+        const bool void_tail = fn.ret_type() == FuncRet::Void && !call->has_result() &&
+                               ret->num_operands() == 0;
+        if (int_tail || void_tail) sites.push_back({block, call});
+    }
+    if (sites.empty() || !fn.entry()) return false;
+
+    BasicBlock* loop_header = fn.entry();
+    BasicBlock* new_entry = fn.create_block();
+    new_entry->push_back(std::make_unique<BrInst>(loop_header));
+    std::list<std::unique_ptr<BasicBlock>>& blocks = fn.blocks();
+    auto new_entry_it = std::prev(blocks.end());
+    blocks.splice(blocks.begin(), blocks, new_entry_it);
+
+    std::vector<PhiInst*> parameter_phis;
+    parameter_phis.reserve(fn.params().size());
+    for (const std::unique_ptr<Value>& param_owner : fn.params()) {
+        Value* param = param_owner.get();
+        auto phi = std::make_unique<PhiInst>(fn.module()->fresh_id());
+        PhiInst* raw = phi.get();
+        param->replace_all_uses_with(raw);
+        raw->add_incoming(param, new_entry);
+        loop_header->push_front(std::move(phi));
+        parameter_phis.push_back(raw);
+    }
+
+    for (const TailSite& site : sites) {
+        for (unsigned i = 0; i < site.call->num_operands(); ++i) {
+            parameter_phis[i]->add_incoming(site.call->operand(i), site.block);
+        }
+        std::list<std::unique_ptr<Instruction>>& insts = site.block->insts();
+        for (const std::unique_ptr<Instruction>& owner : insts) {
+            Instruction* inst = owner.get();
+            if (inst != site.call && inst->opcode() != Opcode::Ret) continue;
+            for (unsigned i = 0; i < inst->num_operands(); ++i) {
+                if (Value* operand = inst->operand(i)) operand->remove_use(inst);
+            }
+        }
+        for (auto it = insts.begin(); it != insts.end();) {
+            Instruction* inst = it->get();
+            if (inst == site.call || inst->opcode() == Opcode::Ret) {
+                it = insts.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        site.block->push_back(std::make_unique<BrInst>(loop_header));
+    }
+    return true;
+}
+
 bool dce(Function& fn) {
     std::unordered_set<Instruction*> live;
     std::vector<Instruction*> work;
@@ -390,10 +530,14 @@ bool cfs(Function& fn) {
 
 bool run_optim(Module& module) {
     bool any = false;
+    for (const std::unique_ptr<Function>& fn : module.functions()) {
+        any |= eliminate_tail_recursion(*fn);
+    }
     for (int iter = 0; iter < 10; ++iter) {
         bool changed = false;
         for (const std::unique_ptr<Function>& fn : module.functions()) {
             changed |= constprop(*fn);
+            changed |= algebraic_simplify(*fn);
             changed |= dce(*fn);
             changed |= gvn(*fn);
             changed |= cfs(*fn);

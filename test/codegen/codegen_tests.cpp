@@ -528,6 +528,39 @@ TEST(Codegen, GlobalRegisterAllocationPreservesCalleeSavedRegisters) {
     EXPECT_NE(std::string::npos, f_assembly.find("    lw s"));
 }
 
+TEST(Codegen, EliminatesSelfTailCallIntoRegisterOnlyLoop) {
+    const std::string asm_text = compile_source_to_asm(
+        "int sum_to(int n, int acc) { if (n <= 0) { return acc; } "
+        "return sum_to(n - 1, acc + n); } "
+        "int main() { return sum_to(10, 0); }\n",
+        CodegenPipeline::Optim);
+
+    const std::size_t function_start = asm_text.find("sum_to:\n");
+    const std::size_t main_start = asm_text.find("main:\n", function_start);
+    ASSERT_NE(std::string::npos, function_start);
+    ASSERT_NE(std::string::npos, main_start);
+    const std::string function_assembly =
+        asm_text.substr(function_start, main_start - function_start);
+    EXPECT_EQ(std::string::npos, function_assembly.find("    call sum_to\n"));
+    EXPECT_EQ(std::string::npos, function_assembly.find("    lw "));
+    EXPECT_EQ(std::string::npos, function_assembly.find("    sw "));
+    EXPECT_NE(std::string::npos, function_assembly.find("    j .Lsum_to_entry\n"));
+    EXPECT_NE(std::string::npos,
+              asm_text.substr(main_start).find("    call sum_to\n"));
+}
+
+TEST(Codegen, HoistsLoopComparisonConstantIntoRegister) {
+    const std::string asm_text = compile_source_to_asm(
+        "int main() { int i = 0; while (i < 1000) { i = i + 1; } return i; }\n",
+        CodegenPipeline::Optim);
+    const std::size_t loop = asm_text.find(".Lmain_bb1:\n");
+    ASSERT_NE(std::string::npos, loop);
+    const std::string prefix = asm_text.substr(0, loop);
+    const std::string loop_and_after = asm_text.substr(loop);
+    EXPECT_NE(std::string::npos, prefix.find("1000"));
+    EXPECT_EQ(std::string::npos, loop_and_after.find("addi t1, x0, 1000"));
+}
+
 TEST(Codegen, P7RemovesFallthroughJumpAfterDirectBranch) {
     const std::string asm_text = compile_source_to_asm(
         "int main() { int x = 0; while (x < 3) { x = x + 1; } return x; }\n");
@@ -546,6 +579,7 @@ TEST(Codegen, CompilesEndToEndCases) {
         "break_continue.tc",
         "global_mutation.tc",
         "call_recursive.tc",
+        "tail_recursive.tc",
         "void_call.tc",
         "many_args.tc",
     };

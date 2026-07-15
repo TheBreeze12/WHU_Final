@@ -59,7 +59,6 @@ public:
     for (const std::unique_ptr<BasicBlock> &block : function.blocks()) {
       int block_phi_count = 0;
       bool phi_temps_needed = false;
-      std::unordered_set<RvReg> phi_destinations;
       for (const std::unique_ptr<Instruction> &inst : block->insts()) {
         if (inst->opcode() == Opcode::Phi) {
           ++block_phi_count;
@@ -67,8 +66,6 @@ public:
             auto destination = allocations->find(inst.get());
             if (destination == allocations->end()) {
               phi_temps_needed = true;
-            } else {
-              phi_destinations.insert(destination->second);
             }
           }
         }
@@ -79,25 +76,6 @@ public:
           const int bytes = static_cast<int>(stack_args * 4);
           if (bytes > outgoing_arg_size_) {
             outgoing_arg_size_ = bytes;
-          }
-        }
-      }
-      if (allocations && !phi_temps_needed) {
-        for (const std::unique_ptr<Instruction> &inst : block->insts()) {
-          if (inst->opcode() != Opcode::Phi) {
-            break;
-          }
-          const RvReg destination = allocations->at(inst.get());
-          for (Value *incoming : inst->operands()) {
-            auto source = allocations->find(incoming);
-            if (source != allocations->end() && source->second != destination &&
-                phi_destinations.count(source->second)) {
-              phi_temps_needed = true;
-              break;
-            }
-          }
-          if (phi_temps_needed) {
-            break;
           }
         }
       }
@@ -116,9 +94,12 @@ public:
     }
     const unsigned register_params =
         static_cast<unsigned>(std::min<std::size_t>(function.params().size(), 8));
+    param_offsets_.assign(register_params, -1);
     for (unsigned i = 0; i < register_params; ++i) {
-      param_offsets_.push_back(next_offset_);
-      next_offset_ += 4;
+      if (!allocations || !allocations->count(function.param(i))) {
+        param_offsets_[i] = next_offset_;
+        next_offset_ += 4;
+      }
     }
     for (const std::unique_ptr<BasicBlock> &block : function.blocks()) {
       for (const std::unique_ptr<Instruction> &inst : block->insts()) {
@@ -142,7 +123,7 @@ public:
     return frame_size_ + static_cast<int>((id - 8) * 4);
   }
   bool has_register_param_slot(unsigned id) const {
-    return id < param_offsets_.size();
+    return id < param_offsets_.size() && param_offsets_[id] >= 0;
   }
   int register_param_offset(unsigned id) const { return param_offsets_[id]; }
   int phi_temp_offset(unsigned index) const { return phi_temp_offsets_[index]; }
@@ -191,6 +172,7 @@ public:
     if (options_.opt_mode) {
       plan_global_registers();
       plan_local_registers();
+      plan_loop_constants();
       collect_used_callee_saved();
       frame_ = FunctionFrame(function_, &value_regs_);
       frame_.reserve_callee_saved(used_callee_saved_);
@@ -503,6 +485,8 @@ private:
       const Instruction *phi;
       Value *incoming;
       RvReg destination;
+      bool has_forced_source = false;
+      RvReg forced_source = RvReg::Zero;
     };
 
     std::vector<PhiCopy> register_copies;
@@ -529,33 +513,71 @@ private:
     // those edges directly and keep the existing two-phase stack copy as the
     // correctness fallback for register cycles or spilled phi results.
     if (all_register_destinations && !register_copies.empty()) {
-      std::unordered_set<RvReg> destinations;
-      for (const PhiCopy &copy : register_copies) {
-        destinations.insert(copy.destination);
-      }
-      bool has_cycle_risk = false;
-      for (const PhiCopy &copy : register_copies) {
-        auto source = value_regs_.find(copy.incoming);
-        if (source != value_regs_.end() && source->second != copy.destination &&
-            destinations.count(source->second)) {
-          has_cycle_risk = true;
-          break;
+      register_copies.erase(
+          std::remove_if(register_copies.begin(), register_copies.end(),
+                         [&](const PhiCopy &copy) {
+                           auto source = value_regs_.find(copy.incoming);
+                           return source != value_regs_.end() &&
+                                  source->second == copy.destination;
+                         }),
+          register_copies.end());
+
+      auto source_register = [&](const PhiCopy &copy, RvReg &source) {
+        if (copy.has_forced_source) {
+          source = copy.forced_source;
+          return true;
         }
-      }
-      if (!has_cycle_risk) {
-        for (const PhiCopy &copy : register_copies) {
-          auto source = value_regs_.find(copy.incoming);
-          if (source != value_regs_.end() &&
-              source->second == copy.destination) {
-            continue;
-          }
-          if (!load_i32(copy.incoming, RvReg::T0)) {
-            return false;
-          }
-          emit_reg_copy(copy.destination, RvReg::T0);
-        }
+        auto allocated = value_regs_.find(copy.incoming);
+        if (allocated == value_regs_.end()) return false;
+        source = allocated->second;
         return true;
+      };
+      while (!register_copies.empty()) {
+        auto ready = register_copies.end();
+        for (auto candidate = register_copies.begin();
+             candidate != register_copies.end(); ++candidate) {
+          bool destination_is_source = false;
+          for (const PhiCopy &other : register_copies) {
+            RvReg source = RvReg::Zero;
+            if (&other != &*candidate && source_register(other, source) &&
+                source == candidate->destination) {
+              destination_is_source = true;
+              break;
+            }
+          }
+          if (!destination_is_source) {
+            ready = candidate;
+            break;
+          }
+        }
+
+        if (ready == register_copies.end()) {
+          const RvReg preserved = register_copies.front().destination;
+          emit_reg_copy(RvReg::T2, preserved);
+          for (PhiCopy &copy : register_copies) {
+            RvReg source = RvReg::Zero;
+            if (source_register(copy, source) && source == preserved) {
+              copy.has_forced_source = true;
+              copy.forced_source = RvReg::T2;
+            }
+          }
+          continue;
+        }
+
+        if (ready->has_forced_source) {
+          emit_reg_copy(ready->destination, ready->forced_source);
+        } else {
+          auto source = value_regs_.find(ready->incoming);
+          if (source != value_regs_.end()) {
+            emit_reg_copy(ready->destination, source->second);
+          } else {
+            if (!load_i32(ready->incoming, RvReg::T0)) return false;
+            emit_reg_copy(ready->destination, RvReg::T0);
+          }
+        }
+        register_copies.erase(ready);
       }
+      return true;
     }
 
     unsigned index = 0;
@@ -670,6 +692,9 @@ private:
                              frame_.register_param_offset(i), RvReg::T0);
       }
     }
+    for (const auto &cached : cached_constants_) {
+      materialize_i32(cached.first->value(), cached.second);
+    }
   }
 
   void emit_epilogue() {
@@ -701,13 +726,13 @@ private:
   }
 
   bool load_i32(Value *value, RvReg dst) {
-    if (value->value_kind() == ValueKind::Constant) {
-      materialize_i32(static_cast<const ConstantInt *>(value)->value(), dst);
-      return true;
-    }
     auto allocated = value_regs_.find(value);
     if (allocated != value_regs_.end()) {
       emit_reg_copy(dst, allocated->second);
+      return true;
+    }
+    if (value->value_kind() == ValueKind::Constant) {
+      materialize_i32(static_cast<const ConstantInt *>(value)->value(), dst);
       return true;
     }
     if (value->value_kind() == ValueKind::Param) {
@@ -727,6 +752,11 @@ private:
   }
 
   bool select_i32_register(Value *value, RvReg scratch, RvReg &selected) {
+    if (value->value_kind() == ValueKind::Constant &&
+        static_cast<const ConstantInt *>(value)->value() == 0) {
+      selected = RvReg::Zero;
+      return true;
+    }
     auto allocated = value_regs_.find(value);
     if (allocated != value_regs_.end()) {
       selected = allocated->second;
@@ -1188,6 +1218,66 @@ private:
     }
   }
 
+  bool block_is_cyclic(const BasicBlock &start) const {
+    std::vector<const BasicBlock *> work = successors(start);
+    std::unordered_set<const BasicBlock *> visited;
+    while (!work.empty()) {
+      const BasicBlock *block = work.back();
+      work.pop_back();
+      if (block == &start) return true;
+      if (!visited.insert(block).second) continue;
+      const std::vector<const BasicBlock *> next = successors(*block);
+      work.insert(work.end(), next.begin(), next.end());
+    }
+    return false;
+  }
+
+  void plan_loop_constants() {
+    for (const std::unique_ptr<BasicBlock> &block : function_.blocks()) {
+      for (const std::unique_ptr<Instruction> &inst : block->insts()) {
+        if (inst->opcode() == Opcode::Call) return;
+      }
+    }
+
+    std::unordered_map<const ConstantInt *, int> hot_constants;
+    for (const std::unique_ptr<BasicBlock> &block : function_.blocks()) {
+      if (!block_is_cyclic(*block)) continue;
+      for (const std::unique_ptr<Instruction> &inst : block->insts()) {
+        if (inst->opcode() == Opcode::Phi) continue;
+        for (unsigned i = 0; i < inst->num_operands(); ++i) {
+          Value *operand = inst->operand(i);
+          if (operand->value_kind() != ValueKind::Constant) continue;
+          const ConstantInt *constant = static_cast<const ConstantInt *>(operand);
+          if (constant->value() == 0) continue;
+          const bool immediate_add =
+              (inst->opcode() == Opcode::Add || inst->opcode() == Opcode::Sub) &&
+              (i == 1 || inst->opcode() == Opcode::Add);
+          if (!immediate_add) ++hot_constants[constant];
+        }
+      }
+    }
+
+    std::vector<std::pair<const ConstantInt *, int>> ordered(
+        hot_constants.begin(), hot_constants.end());
+    std::sort(ordered.begin(), ordered.end(), [](const auto &lhs, const auto &rhs) {
+      if (lhs.second != rhs.second) return lhs.second > rhs.second;
+      return lhs.first->value() < rhs.first->value();
+    });
+    const std::vector<RvReg> registers = {
+        RvReg::T3, RvReg::T4, RvReg::T5, RvReg::T6};
+    std::unordered_set<RvReg> used;
+    for (const auto &allocation : value_regs_) used.insert(allocation.second);
+    for (const auto &candidate : ordered) {
+      for (RvReg reg : registers) {
+        if (used.count(reg)) continue;
+        value_regs_.emplace(candidate.first, reg);
+        cached_constants_.push_back({candidate.first, reg});
+        used.insert(reg);
+        break;
+      }
+    }
+  }
+
   void plan_local_registers() {
     const std::vector<RvReg> temp_regs = {RvReg::T3, RvReg::T4, RvReg::T5,
                                           RvReg::T6};
@@ -1277,6 +1367,7 @@ private:
   bool emitted_exit_ = false;
   std::unordered_map<const Value *, RvReg> value_regs_;
   std::vector<RvReg> used_callee_saved_;
+  std::vector<std::pair<const ConstantInt *, RvReg>> cached_constants_;
   const std::vector<RvReg> arg_regs_ = {
       RvReg::A0, RvReg::A1, RvReg::A2, RvReg::A3,
       RvReg::A4, RvReg::A5, RvReg::A6, RvReg::A7,
