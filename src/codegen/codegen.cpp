@@ -44,6 +44,15 @@ bool is_direct_branch_condition_value(const Instruction &inst) {
              Opcode::CondBr;
 }
 
+bool positive_power_of_two_shift(int value, unsigned &shift) {
+  if (value <= 1) return false;
+  const std::uint32_t bits = static_cast<std::uint32_t>(value);
+  if ((bits & (bits - 1u)) != 0) return false;
+  shift = 0;
+  for (std::uint32_t cursor = bits; cursor > 1u; cursor >>= 1u) ++shift;
+  return true;
+}
+
 class FunctionFrame {
 public:
   using RegisterAssignments = std::unordered_map<const Value *, RvReg>;
@@ -169,6 +178,7 @@ public:
                   DiagnosticEngine &diagnostics, AsmWriter &writer)
       : function_(function), options_(options), diagnostics_(diagnostics),
         writer_(writer), frame_(function) {
+    plan_block_layout();
     if (options_.opt_mode) {
       plan_global_registers();
       plan_local_registers();
@@ -184,8 +194,8 @@ public:
       return false;
     }
     emit_prologue();
-    for (const std::unique_ptr<BasicBlock> &block : function_.blocks()) {
-      if (block.get() != function_.entry()) {
+    for (const BasicBlock *block : layout_) {
+      if (block != function_.entry()) {
         writer_.label(block_label(function_, *block));
       }
       for (const std::unique_ptr<Instruction> &inst : block->insts()) {
@@ -277,8 +287,54 @@ private:
   }
 
   bool lower_binary(const Instruction &inst) {
+    if (inst.opcode() == Opcode::Shl || inst.opcode() == Opcode::Shr) {
+      if (inst.num_operands() != 1) {
+        return fail("malformed shift instruction");
+      }
+      RvReg source = RvReg::T0;
+      if (!select_i32_register(inst.operand(0), RvReg::T0, source)) {
+        return false;
+      }
+      const RvReg destination = result_register(inst, RvReg::T2);
+      const unsigned amount = inst.opcode() == Opcode::Shl
+          ? static_cast<const ShlInst &>(inst).amount()
+          : static_cast<const ShrInst &>(inst).amount();
+      writer_.inst(inst.opcode() == Opcode::Shl ? "slli" : "srai",
+                   reg_name(destination), reg_name(source),
+                   std::to_string(amount));
+      return spill_result(inst, destination);
+    }
     if (inst.num_operands() != 2) {
       return fail("malformed binary instruction");
+    }
+    if ((inst.opcode() == Opcode::Sdiv || inst.opcode() == Opcode::Srem) &&
+        inst.operand(1)->value_kind() == ValueKind::Constant) {
+      unsigned shift = 0;
+      const int divisor =
+          static_cast<const ConstantInt *>(inst.operand(1))->value();
+      if (positive_power_of_two_shift(divisor, shift)) {
+        RvReg source = RvReg::T0;
+        if (!select_i32_register(inst.operand(0), RvReg::T0, source)) {
+          return false;
+        }
+        const RvReg destination = result_register(inst, RvReg::T2);
+        writer_.inst("srai", reg_name(RvReg::T1), reg_name(source), "31");
+        writer_.inst("srli", reg_name(RvReg::T1), reg_name(RvReg::T1),
+                     std::to_string(32u - shift));
+        writer_.inst("add", reg_name(RvReg::T1), reg_name(source),
+                     reg_name(RvReg::T1));
+        writer_.inst("srai", reg_name(RvReg::T1), reg_name(RvReg::T1),
+                     std::to_string(shift));
+        if (inst.opcode() == Opcode::Sdiv) {
+          emit_reg_copy(destination, RvReg::T1);
+        } else {
+          writer_.inst("slli", reg_name(RvReg::T1), reg_name(RvReg::T1),
+                       std::to_string(shift));
+          writer_.inst("sub", reg_name(destination), reg_name(source),
+                       reg_name(RvReg::T1));
+        }
+        return spill_result(inst, destination);
+      }
     }
     if (try_lower_immediate_binary(inst)) {
       return true;
@@ -300,12 +356,6 @@ private:
       writer_.inst("div", reg_name(destination), reg_name(lhs), reg_name(rhs));
     } else if (inst.opcode() == Opcode::Srem) {
       writer_.inst("rem", reg_name(destination), reg_name(lhs), reg_name(rhs));
-    } else if (inst.opcode() == Opcode::Shl) {
-      writer_.inst("slli", reg_name(destination), reg_name(lhs),
-                   std::to_string(static_cast<const ShlInst &>(inst).amount()));
-    } else {
-      writer_.inst("srai", reg_name(destination), reg_name(lhs),
-                   std::to_string(static_cast<const ShrInst &>(inst).amount()));
     }
     return spill_result(inst, destination);
   }
@@ -394,6 +444,8 @@ private:
         *static_cast<const BasicBlock *>(inst.operand(1));
     const BasicBlock &false_target =
         *static_cast<const BasicBlock *>(inst.operand(2));
+    const bool edge_copies_needed = block_starts_with_phi(true_target) ||
+                                    block_starts_with_phi(false_target);
     const std::string true_copy_label = edge_copy_label(*inst.parent(), true_target);
     if (try_lower_direct_compare_branch(inst, true_target, false_target,
                                         true_copy_label)) {
@@ -402,6 +454,18 @@ private:
     RvReg condition = RvReg::T0;
     if (!select_i32_register(inst.operand(0), RvReg::T0, condition)) {
       return false;
+    }
+    if (options_.opt_mode && !edge_copies_needed &&
+        is_fallthrough(*inst.parent(), true_target)) {
+      writer_.inst("beq", reg_name(condition), reg_name(RvReg::Zero),
+                   block_label(function_, false_target));
+      return true;
+    }
+    if (options_.opt_mode && !edge_copies_needed &&
+        is_fallthrough(*inst.parent(), false_target)) {
+      writer_.inst("bne", reg_name(condition), reg_name(RvReg::Zero),
+                   block_label(function_, true_target));
+      return true;
     }
     writer_.inst("bne", reg_name(condition), reg_name(RvReg::Zero),
                  true_copy_label);
@@ -435,6 +499,69 @@ private:
     if (!select_i32_register(cmp->operand(0), RvReg::T0, lhs) ||
         !select_i32_register(cmp->operand(1), RvReg::T1, rhs)) {
       return false;
+    }
+
+    if (options_.opt_mode && !block_starts_with_phi(true_target) &&
+        !block_starts_with_phi(false_target)) {
+      if (is_fallthrough(*branch.parent(), true_target)) {
+        switch (cmp->opcode()) {
+        case Opcode::ICmpEq:
+          writer_.inst("bne", reg_name(lhs), reg_name(rhs),
+                       block_label(function_, false_target));
+          return true;
+        case Opcode::ICmpNe:
+          writer_.inst("beq", reg_name(lhs), reg_name(rhs),
+                       block_label(function_, false_target));
+          return true;
+        case Opcode::ICmpSlt:
+          writer_.inst("bge", reg_name(lhs), reg_name(rhs),
+                       block_label(function_, false_target));
+          return true;
+        case Opcode::ICmpSgt:
+          writer_.inst("bge", reg_name(rhs), reg_name(lhs),
+                       block_label(function_, false_target));
+          return true;
+        case Opcode::ICmpSle:
+          writer_.inst("blt", reg_name(rhs), reg_name(lhs),
+                       block_label(function_, false_target));
+          return true;
+        case Opcode::ICmpSge:
+          writer_.inst("blt", reg_name(lhs), reg_name(rhs),
+                       block_label(function_, false_target));
+          return true;
+        default:
+          break;
+        }
+      } else if (is_fallthrough(*branch.parent(), false_target)) {
+        switch (cmp->opcode()) {
+        case Opcode::ICmpEq:
+          writer_.inst("beq", reg_name(lhs), reg_name(rhs),
+                       block_label(function_, true_target));
+          return true;
+        case Opcode::ICmpNe:
+          writer_.inst("bne", reg_name(lhs), reg_name(rhs),
+                       block_label(function_, true_target));
+          return true;
+        case Opcode::ICmpSlt:
+          writer_.inst("blt", reg_name(lhs), reg_name(rhs),
+                       block_label(function_, true_target));
+          return true;
+        case Opcode::ICmpSgt:
+          writer_.inst("blt", reg_name(rhs), reg_name(lhs),
+                       block_label(function_, true_target));
+          return true;
+        case Opcode::ICmpSle:
+          writer_.inst("bge", reg_name(rhs), reg_name(lhs),
+                       block_label(function_, true_target));
+          return true;
+        case Opcode::ICmpSge:
+          writer_.inst("bge", reg_name(lhs), reg_name(rhs),
+                       block_label(function_, true_target));
+          return true;
+        default:
+          break;
+        }
+      }
     }
 
     switch (cmp->opcode()) {
@@ -633,18 +760,79 @@ private:
 
   bool lower_call(const Instruction &inst) {
     const CallInst &call = static_cast<const CallInst &>(inst);
-    for (unsigned i = 0; i < inst.num_operands(); ++i) {
-      if (i < arg_regs_.size()) {
-        if (!load_i32(inst.operand(i), arg_regs_[i])) {
-          return false;
-        }
-      } else {
-        if (!load_i32(inst.operand(i), RvReg::T0)) {
-          return false;
-        }
-        emit_store_from_base(RvReg::T0, RvReg::Sp,
-                             static_cast<int>((i - 8) * 4), RvReg::T2);
+    // Stack arguments are evaluated first: assigning a0-a7 may overwrite a
+    // register that still supplies a later stack argument.
+    for (unsigned i = static_cast<unsigned>(arg_regs_.size());
+         i < inst.num_operands(); ++i) {
+      if (!load_i32(inst.operand(i), RvReg::T0)) return false;
+      emit_store_from_base(RvReg::T0, RvReg::Sp,
+                           static_cast<int>((i - 8) * 4), RvReg::T2);
+    }
+
+    struct ArgCopy {
+      Value *value;
+      RvReg destination;
+      bool forced = false;
+      RvReg forced_source = RvReg::Zero;
+    };
+    std::vector<ArgCopy> copies;
+    const unsigned register_args = static_cast<unsigned>(
+        std::min<std::size_t>(inst.num_operands(), arg_regs_.size()));
+    for (unsigned i = 0; i < register_args; ++i) {
+      auto source = value_regs_.find(inst.operand(i));
+      if (source != value_regs_.end() && source->second == arg_regs_[i]) continue;
+      copies.push_back({inst.operand(i), arg_regs_[i]});
+    }
+    auto source_register = [&](const ArgCopy &copy, RvReg &source) {
+      if (copy.forced) {
+        source = copy.forced_source;
+        return true;
       }
+      auto allocated = value_regs_.find(copy.value);
+      if (allocated == value_regs_.end()) return false;
+      source = allocated->second;
+      return true;
+    };
+    while (!copies.empty()) {
+      auto ready = copies.end();
+      for (auto candidate = copies.begin(); candidate != copies.end(); ++candidate) {
+        bool destination_needed = false;
+        for (const ArgCopy &other : copies) {
+          RvReg source = RvReg::Zero;
+          if (&other != &*candidate && source_register(other, source) &&
+              source == candidate->destination) {
+            destination_needed = true;
+            break;
+          }
+        }
+        if (!destination_needed) {
+          ready = candidate;
+          break;
+        }
+      }
+      if (ready == copies.end()) {
+        const RvReg preserved = copies.front().destination;
+        emit_reg_copy(RvReg::T2, preserved);
+        for (ArgCopy &copy : copies) {
+          RvReg source = RvReg::Zero;
+          if (source_register(copy, source) && source == preserved) {
+            copy.forced = true;
+            copy.forced_source = RvReg::T2;
+          }
+        }
+        continue;
+      }
+      if (ready->forced) {
+        emit_reg_copy(ready->destination, ready->forced_source);
+      } else {
+        auto source = value_regs_.find(ready->value);
+        if (source != value_regs_.end()) {
+          emit_reg_copy(ready->destination, source->second);
+        } else if (!load_i32(ready->value, ready->destination)) {
+          return false;
+        }
+      }
+      copies.erase(ready);
     }
     writer_.inst("call", call.callee_name());
     if (inst.has_result()) {
@@ -928,14 +1116,43 @@ private:
   }
 
   bool is_fallthrough(const BasicBlock &from, const BasicBlock &to) const {
-    for (auto it = function_.blocks().begin(); it != function_.blocks().end(); ++it) {
-      if (it->get() != &from) {
-        continue;
-      }
-      ++it;
-      return it != function_.blocks().end() && it->get() == &to;
+    for (std::size_t i = 0; i + 1 < layout_.size(); ++i) {
+      if (layout_[i] == &from) return layout_[i + 1] == &to;
     }
     return false;
+  }
+
+  void plan_block_layout() {
+    for (const std::unique_ptr<BasicBlock> &block : function_.blocks()) {
+      layout_.push_back(block.get());
+    }
+    if (!options_.opt_mode || layout_.size() < 4) return;
+
+    // Rotate the canonical IRGen while layout
+    //   preheader, header, body, exit
+    // into
+    //   preheader, body, header, exit.
+    // The preheader pays one initial jump, while every hot iteration loses its
+    // unconditional back-edge jump.
+    for (std::size_t i = 1; i + 2 < layout_.size(); ++i) {
+      const BasicBlock *header = layout_[i];
+      const BasicBlock *body = layout_[i + 1];
+      const BasicBlock *exit = layout_[i + 2];
+      const Instruction *header_term = header->terminator();
+      const Instruction *body_term = body->terminator();
+      if (!header_term || header_term->opcode() != Opcode::CondBr ||
+          !body_term || body_term->opcode() != Opcode::Br) {
+        continue;
+      }
+      if (header_term->operand(1) != body || header_term->operand(2) != exit ||
+          body_term->operand(0) != header) {
+        continue;
+      }
+      layout_[i] = body;
+      layout_[i + 1] = header;
+      layout_[i + 2] = exit;
+      i += 2;
+    }
   }
 
   static bool is_register_candidate(const Instruction &inst) {
@@ -959,6 +1176,11 @@ private:
     default:
       return false;
     }
+  }
+
+  static bool block_starts_with_phi(const BasicBlock &block) {
+    return !block.insts().empty() &&
+           block.insts().front()->opcode() == Opcode::Phi;
   }
 
   using ValueSet = std::unordered_set<const Value *>;
@@ -1144,14 +1366,32 @@ private:
     }
 
     std::vector<const Value *> order = candidate_order;
+    std::unordered_map<const BasicBlock *, int> block_weight;
+    for (const std::unique_ptr<BasicBlock> &block : function_.blocks()) {
+      block_weight[block.get()] = block_is_cyclic(*block) ? 16 : 1;
+    }
+    std::unordered_map<const Value *, int> weighted_uses;
+    for (const Value *candidate : candidates) {
+      int score = 0;
+      for (const User *user : candidate->uses()) {
+        const Instruction *inst = dynamic_cast<const Instruction *>(user);
+        score += inst && inst->parent() ? block_weight[inst->parent()] : 1;
+      }
+      const Instruction *definition =
+          dynamic_cast<const Instruction *>(candidate);
+      if (definition && definition->parent()) {
+        score += block_weight[definition->parent()];
+      }
+      weighted_uses[candidate] = score;
+    }
     std::unordered_map<const Value *, std::size_t> stable_index;
     for (std::size_t i = 0; i < candidate_order.size(); ++i) {
       stable_index.emplace(candidate_order[i], i);
     }
-    auto priority = [](const Value *value) {
-      int score = static_cast<int>(value->uses().size()) * 10;
+    auto priority = [&](const Value *value) {
+      int score = weighted_uses[value] * 10;
       if (value->value_kind() == ValueKind::Param) {
-        score += 30;
+        score += 500;
       }
       const Instruction *inst = dynamic_cast<const Instruction *>(value);
       if (inst && inst->opcode() == Opcode::Phi) {
@@ -1177,6 +1417,9 @@ private:
 
     const std::vector<RvReg> caller_saved = {
         RvReg::T3, RvReg::T4, RvReg::T5, RvReg::T6};
+    const std::vector<RvReg> leaf_arg_registers = {
+        RvReg::A0, RvReg::A1, RvReg::A2, RvReg::A3,
+        RvReg::A4, RvReg::A5, RvReg::A6, RvReg::A7};
     const std::vector<RvReg> callee_saved = {
         RvReg::S1, RvReg::S2, RvReg::S3, RvReg::S4, RvReg::S5, RvReg::S6,
         RvReg::S7, RvReg::S8, RvReg::S9, RvReg::S10, RvReg::S11};
@@ -1192,6 +1435,12 @@ private:
       if (!crosses_call.count(value)) {
         registers.insert(registers.end(), caller_saved.begin(),
                          caller_saved.end());
+        if (value->value_kind() == ValueKind::Param && value->id() < 8) {
+          registers.insert(registers.begin(),
+                           leaf_arg_registers[value->id()]);
+        }
+        registers.insert(registers.end(), leaf_arg_registers.begin(),
+                         leaf_arg_registers.end());
       }
       registers.insert(registers.end(), callee_saved.begin(),
                        callee_saved.end());
@@ -1366,6 +1615,7 @@ private:
   FunctionFrame frame_;
   bool emitted_exit_ = false;
   std::unordered_map<const Value *, RvReg> value_regs_;
+  std::vector<const BasicBlock *> layout_;
   std::vector<RvReg> used_callee_saved_;
   std::vector<std::pair<const ConstantInt *, RvReg>> cached_constants_;
   const std::vector<RvReg> arg_regs_ = {
