@@ -93,6 +93,9 @@ std::string compile_source_to_asm(const std::string& source,
         return {};
     }
 
+    if (pipeline == CodegenPipeline::Optim) {
+        localize_globals(*module);
+    }
     if (pipeline == CodegenPipeline::Mem2Reg || pipeline == CodegenPipeline::Optim) {
         mem2reg(*module);
     }
@@ -559,6 +562,22 @@ TEST(Codegen, HoistsLoopComparisonConstantIntoRegister) {
     const std::string loop_and_after = asm_text.substr(loop);
     EXPECT_NE(std::string::npos, prefix.find("1000"));
     EXPECT_EQ(std::string::npos, loop_and_after.find("addi t1, x0, 1000"));
+}
+
+TEST(Codegen, LocalizesGlobalMutationOutsideHotLoop) {
+    const std::string asm_text = compile_source_to_asm(
+        "int g = 0; int main() { int i = 0; while (i < 1000) { "
+        "g = g + i; i = i + 1; } return g; }\n",
+        CodegenPipeline::Optim);
+    const std::size_t loop_start = asm_text.find(".Lmain_bb1:\n");
+    const std::size_t loop_end = asm_text.find(".Lmain_bb3:\n", loop_start);
+    ASSERT_NE(std::string::npos, loop_start);
+    ASSERT_NE(std::string::npos, loop_end);
+    const std::string hot_loop =
+        asm_text.substr(loop_start, loop_end - loop_start);
+    EXPECT_EQ(std::string::npos, hot_loop.find("%hi(g)")) << hot_loop;
+    EXPECT_EQ(std::string::npos, hot_loop.find("    lw ")) << hot_loop;
+    EXPECT_EQ(std::string::npos, hot_loop.find("    sw ")) << hot_loop;
 }
 
 TEST(Codegen, P7RemovesFallthroughJumpAfterDirectBranch) {

@@ -13,6 +13,7 @@ bool dce(Function& fn);
 bool gvn(Function& fn);
 bool cfs(Function& fn);
 bool eliminate_tail_recursion(Function& fn);
+bool localize_globals(Module& module);
 
 // Drives the four passes to a fixpoint over every function (design §9).
 bool run_optim(Module& module);

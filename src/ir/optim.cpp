@@ -466,6 +466,92 @@ bool eliminate_tail_recursion(Function& fn) {
     return true;
 }
 
+bool localize_globals(Module& module) {
+    bool changed = false;
+    for (const std::unique_ptr<Function>& fn_owner : module.functions()) {
+        Function& fn = *fn_owner;
+        if (!fn.entry()) continue;
+
+        bool has_call = false;
+        bool has_fallthrough_exit = false;
+        struct GlobalAccess {
+            GlobalAddr* address = nullptr;
+            bool written = false;
+        };
+        std::unordered_map<GlobalAddr*, GlobalAccess> accesses;
+        for (const std::unique_ptr<BasicBlock>& block : fn.blocks()) {
+            if (!block->is_terminated()) has_fallthrough_exit = true;
+            for (const std::unique_ptr<Instruction>& inst : block->insts()) {
+                if (inst->opcode() == Opcode::Call) has_call = true;
+                if ((inst->opcode() == Opcode::Load || inst->opcode() == Opcode::Store) &&
+                    inst->num_operands() > 0 &&
+                    inst->operand(0)->value_kind() == ValueKind::GlobalAddr) {
+                    GlobalAddr* address = static_cast<GlobalAddr*>(inst->operand(0));
+                    GlobalAccess& access = accesses[address];
+                    access.address = address;
+                    if (inst->opcode() == Opcode::Store) access.written = true;
+                }
+            }
+        }
+        if (has_call || accesses.empty()) continue;
+
+        BasicBlock* entry = fn.entry();
+        auto insertion = entry->insts().begin();
+        for (auto& [address, access] : accesses) {
+            if (access.written && has_fallthrough_exit) continue;
+
+            auto slot_owner = std::make_unique<AllocaInst>(module.fresh_id());
+            AllocaInst* slot = slot_owner.get();
+            slot->set_parent(entry);
+            insertion = std::next(entry->insts().insert(insertion, std::move(slot_owner)));
+
+            auto initial_load_owner = std::make_unique<LoadInst>(address, module.fresh_id());
+            LoadInst* initial_load = initial_load_owner.get();
+            initial_load->set_parent(entry);
+            insertion = std::next(
+                entry->insts().insert(insertion, std::move(initial_load_owner)));
+
+            auto initial_store_owner =
+                std::make_unique<StoreInst>(slot, initial_load);
+            initial_store_owner->set_parent(entry);
+            insertion = std::next(
+                entry->insts().insert(insertion, std::move(initial_store_owner)));
+
+            for (const std::unique_ptr<BasicBlock>& block : fn.blocks()) {
+                for (const std::unique_ptr<Instruction>& inst : block->insts()) {
+                    if (inst.get() == initial_load) continue;
+                    if ((inst->opcode() == Opcode::Load ||
+                         inst->opcode() == Opcode::Store) &&
+                        inst->num_operands() > 0 && inst->operand(0) == address) {
+                        inst->set_operand(0, slot);
+                    }
+                }
+            }
+
+            if (access.written) {
+                for (const std::unique_ptr<BasicBlock>& block : fn.blocks()) {
+                    std::list<std::unique_ptr<Instruction>>& insts = block->insts();
+                    for (auto it = insts.begin(); it != insts.end(); ++it) {
+                        if ((*it)->opcode() != Opcode::Ret) continue;
+                        auto final_load_owner =
+                            std::make_unique<LoadInst>(slot, module.fresh_id());
+                        LoadInst* final_load = final_load_owner.get();
+                        final_load->set_parent(block.get());
+                        insts.insert(it, std::move(final_load_owner));
+                        auto final_store_owner =
+                            std::make_unique<StoreInst>(address, final_load);
+                        final_store_owner->set_parent(block.get());
+                        insts.insert(it, std::move(final_store_owner));
+                        break;
+                    }
+                }
+            }
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 bool dce(Function& fn) {
     std::unordered_set<Instruction*> live;
     std::vector<Instruction*> work;

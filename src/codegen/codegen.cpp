@@ -752,7 +752,7 @@ private:
   }
 
   bool select_i32_register(Value *value, RvReg scratch, RvReg &selected) {
-    if (value->value_kind() == ValueKind::Constant &&
+    if (options_.opt_mode && value->value_kind() == ValueKind::Constant &&
         static_cast<const ConstantInt *>(value)->value() == 0) {
       selected = RvReg::Zero;
       return true;

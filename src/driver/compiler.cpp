@@ -30,6 +30,9 @@ std::unique_ptr<Module> build_ir(const CompUnit& unit,
         return nullptr;
     }
     if (options.opt_mode || options.mem2reg_only) {
+        if (options.opt_mode) {
+            localize_globals(*ir);
+        }
         mem2reg(*ir);
     }
     if (options.opt_mode) {
